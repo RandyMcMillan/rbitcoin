@@ -10,6 +10,8 @@ exclude = [
   "**/testutil.rs",
   "**/tests/**",
   "**/core_vectors.rs",
+  # Compiled only with the CI-only `write-probe` feature; coverage never builds it.
+  "**/write_probe.rs",
 ]
 allow = [
   "ChainHub::accept_incoming",

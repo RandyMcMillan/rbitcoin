@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+"""Per-file ceiling for raw store and mempool page writes.
+
+Counts call sites under crates/rbitcoin-store/src and
+crates/rbitcoin-mempool/src. Skips tests/, benches/, *tests.rs, and
+items marked #[cfg(test)]. Comments and strings do not count.
+
+lint/page-write-baseline.txt is sorted `path<TAB>token<TAB>count` lines
+for counts above zero. A token above its line, a positive token with no
+line, or a line that is now lower (or whose file is gone) fails.
+--write rewrites the file from the tree.
+
+`write_all(` counts in both crates. The store's sites today write a
+whole new file or a temp before a rename, or replay a synced ahead image
+in place at open. The baseline freezes them per file, so a new
+`std::io::Write::write_all` on a store data file moves its line. `handle_pwrite_all(` does not match inside `pwrite_all`.
+
+`io_write` is `std::io::Write::write` with a borrowed byte argument
+(`file.write(&bytes)`), the short-write form of `write_all`. It needs the
+leading `.` and the `&`, so `RwLock::write()`, `OpenOptions::write(true)`,
+and `write_guard()` do not match.
+
+The Windows raw writes count too. `WriteFile` is the overlapped submit
+in `win_xfer` and `IocpEngine::issue`, the twin of `opcode_Write`.
+`seek_write` is the Windows `FileExt` positional write. `win_set_eof`
+resizes a file like `set_len`. For `WriteFile` and `win_set_eof` only
+calls count; the `fn` line that declares or defines one does not.
+
+`write_at`, `write_at_pwrite`, `write_uncommitted`, `pwrite_all`,
+`persist_hwm`, `persist_logical_len`, `write_trailer`, and `zero_range`
+go through `TableFile::pwrite_all` or the same armed-page check. They
+are the door, not a raw site. The raw positional write is
+`std::os::unix::fs::FileExt`, which shares the door's `write_at` name, so
+each mention of `FileExt` (its import or a path-qualified call) is counted.
+In a file that mentions `FileExt`, each `write_at(` and `write_all_at(`
+call is also counted as `FileExt_write`, door calls included, so a new
+method-form raw write moves the baseline even after the import is there.
+"""
+
+import argparse
+import importlib.util
+import os
+import re
+import sys
+
+CRATES = ("rbitcoin-mempool", "rbitcoin-store")
+
+# (token, pattern, crates that count it). None counts both crates.
+TOKENS = (
+    ("FileExt", r"(?<![A-Za-z0-9_])FileExt(?![A-Za-z0-9_])", None),
+    ("WriteOp", r"(?<![A-Za-z0-9_])WriteOp\s*\{", None),
+    ("opcode_Write", r"opcode::Write::new\s*\(", None),
+    ("fs_write", r"(?<![A-Za-z0-9_])fs::write\s*\(", None),
+    ("handle_pwrite_all", r"(?<![A-Za-z0-9_])handle_pwrite_all\s*\(", None),
+    ("pwrite", r"(?<![A-Za-z0-9_])pwrite\s*\(", None),
+    ("pwrite_batch", r"(?<![A-Za-z0-9_])pwrite_batch\s*\(", None),
+    ("pwrite_exact", r"(?<![A-Za-z0-9_])pwrite_exact\s*\(", None),
+    ("set_file_len", r"(?<![A-Za-z0-9_])set_file_len\s*\(", None),
+    ("set_len", r"(?<![A-Za-z0-9_])set_len\s*\(", None),
+    ("truncate", r"(?<![A-Za-z0-9_])truncate\s*\(", None),
+    ("write_all", r"(?<![A-Za-z0-9_])write_all\s*\(", None),
+    ("io_write", r"\.write\s*\(\s*&", None),
+    ("WriteFile", r"(?<![A-Za-z0-9_])WriteFile\s*\(", None),
+    ("seek_write", r"(?<![A-Za-z0-9_])seek_write\s*\(", None),
+    ("win_set_eof", r"(?<![A-Za-z0-9_])win_set_eof\s*\(", None),
+)
+
+# Splits a token's own pattern does not imply: (previous line, this line).
+# rustfmt can break `.write(` from its `&bytes` argument, or `.write` from
+# its `(&bytes)`.
+SPLITS = {
+    "io_write": (
+        (r"\.write\s*\(\s*$", r"^\s*&"),
+        (r"\.write\s*$", r"^\s*\(\s*&"),
+    ),
+}
+
+# A declaration or definition is not a call: `fn NAME(` on one line, or
+# `fn` ending one code line and `NAME(` opening the next, with any spacing.
+DECLS = {
+    tok: (
+        re.compile(r"(?<![A-Za-z0-9_])fn\s+" + tok + r"\s*\("),
+        re.compile(r"(?<![A-Za-z0-9_])fn\s*$"),
+        re.compile(r"^\s*" + tok + r"\s*\("),
+    )
+    for tok in ("WriteFile", "win_set_eof")
+}
+
+# Counted only in a file whose `FileExt` count is above zero. The method
+# form `file.write_at(..)` names no trait, so the import alone would hide
+# every later call. Door `write_at` calls in such a file count too.
+FILEEXT_WRITE = ("FileExt_write", r"(?<![A-Za-z0-9_])write(?:_all)?_at\s*\(")
+
+
+def load_unwrap():
+    path = os.path.join(os.path.dirname(__file__), "unwrap-ratchet.py")
+    spec = importlib.util.spec_from_file_location("unwrap_ratchet", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def scan(root: str) -> dict[str, int]:
+    ratchet = load_unwrap()
+    compiled = []
+    for token, pattern, only in TOKENS + ((*FILEEXT_WRITE, None),):
+        # The name may end one line and its `(` or `{` open the next code
+        # line. Blank and comment-only lines between them do not count.
+        # A bare name (`FileExt`) has no opener to split from.
+        call = re.match(r"(.*)\\s\*(\\\(|\\\{)$", pattern)
+        splits = ()
+        if token in SPLITS:
+            splits = tuple(
+                (re.compile(a), re.compile(b)) for a, b in SPLITS[token]
+            )
+        elif call:
+            name, opener = call.groups()
+            splits = ((re.compile(name + r"\s*$"), re.compile(r"^\s*" + opener)),)
+        compiled.append((token, re.compile(pattern), only, splits))
+    counts: dict[str, int] = {}
+    for crate in CRATES:
+        src = os.path.join(root, "crates", crate, "src")
+        if not os.path.isdir(src):
+            continue
+        for dirpath, dirnames, filenames in os.walk(src):
+            dirnames[:] = [d for d in dirnames if d != "target"]
+            rel_dir = os.path.relpath(dirpath, root).replace(os.sep, "/")
+            parts = rel_dir.split("/")
+            if "tests" in parts or "benches" in parts:
+                continue
+            for name in filenames:
+                if not name.endswith(".rs") or name.endswith("tests.rs"):
+                    continue
+                rel = f"{rel_dir}/{name}"
+                full = os.path.join(dirpath, name)
+                for token, rx, only, splits in compiled:
+                    if only is not None and crate not in only:
+                        continue
+                    if token == FILEEXT_WRITE[0] and f"{rel}\tFileExt" not in counts:
+                        continue
+
+                    def line_fn(code, prev, rx=rx, splits=splits, token=token):
+                        n = len(rx.findall(code))
+                        for a, b in splits:
+                            if a.search(prev) and b.search(code):
+                                n += 1
+                        decl = DECLS.get(token)
+                        if decl:
+                            n -= len(decl[0].findall(code))
+                            if decl[1].search(prev) and decl[2].search(code):
+                                n -= 1
+                        return max(n, 0)
+
+                    got = ratchet.file_count(full, line_fn)
+                    if got:
+                        counts[f"{rel}\t{token}"] = got
+    return counts
+
+
+def read_baseline(path: str) -> dict[str, int]:
+    if not os.path.exists(path):
+        sys.exit(f"missing baseline {path}")
+    out: dict[str, int] = {}
+    for raw in open(path, encoding="utf-8"):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        path_s, token, count_s = line.split("\t")
+        out[f"{path_s}\t{token}"] = int(count_s)
+    return out
+
+
+def write_baseline(path: str, counts: dict[str, int]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    lines = [f"{key}\t{counts[key]}\n" for key in sorted(counts)]
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.writelines(lines)
+
+
+def check(counts: dict[str, int], base: dict[str, int]) -> list[str]:
+    errors = []
+    for key in sorted(set(counts) | set(base)):
+        got = counts.get(key, 0)
+        if key not in base:
+            errors.append(f"{key}: {got} raw writes, baseline has no line")
+            continue
+        want = base[key]
+        if got > want:
+            errors.append(f"{key}: {got} raw writes, baseline {want}")
+        elif got < want:
+            errors.append(f"{key}: {got} raw writes, baseline {want} (lower the line)")
+    return errors
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--root", default=None)
+    parser.add_argument("--write", action="store_true")
+    args = parser.parse_args()
+    root = os.path.abspath(args.root or os.path.join(os.path.dirname(__file__), ".."))
+    baseline = os.path.join(root, "lint", "page-write-baseline.txt")
+    counts = scan(root)
+    if args.write:
+        write_baseline(baseline, counts)
+        print(f"wrote {len(counts)} lines to {baseline}")
+        return 0
+    errors = check(counts, read_baseline(baseline))
+    if errors:
+        print("\n".join(errors), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -742,94 +742,32 @@ fn array_open_rejects_a_ragged_body() {
     let _ = std::fs::remove_file(&path);
 }
 
-fn ahead_side(path: &std::path::Path) -> std::path::PathBuf {
-    let mut name = path.file_name().unwrap().to_os_string();
-    name.push(".ahead");
-    path.with_file_name(name)
-}
-
-fn ahead_header(logical: u64) -> [u8; 16] {
-    let mut h = [0u8; 16];
-    h[8..16].copy_from_slice(&logical.to_le_bytes());
-    h
-}
-
-fn ahead_rec(off: u64, image: &[u8]) -> Vec<u8> {
-    use bitcoin_hashes::{sha256, Hash, HashEngine};
-    let mut out = Vec::new();
-    out.extend_from_slice(&off.to_le_bytes());
-    out.extend_from_slice(&(image.len() as u32).to_le_bytes());
-    let mut eng = sha256::HashEngine::default();
-    eng.input(&off.to_le_bytes());
-    eng.input(&(image.len() as u32).to_le_bytes());
-    eng.input(image);
-    out.extend_from_slice(&sha256::Hash::from_engine(eng).to_byte_array());
-    out.extend_from_slice(image);
-    out
-}
-
-fn ahead_raw(version: u16, count: u32, header: [u8; 16], records: &[Vec<u8>]) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(b"ATA1");
-    out.extend_from_slice(&version.to_le_bytes());
-    out.extend_from_slice(&0u16.to_le_bytes());
-    out.extend_from_slice(&count.to_le_bytes());
-    out.extend_from_slice(&header);
-    for r in records {
-        out.extend_from_slice(r);
-    }
-    out
-}
-
+/// An fd-only write that fails after its arm leaves images a later write
+/// must not drop. The later write refuses until reopen restores the mark.
+#[cfg(debug_assertions)]
 #[test]
-fn ahead_rejects_every_bad_shape_and_applies_a_good_one() {
-    use rbitcoin_store::array_table::ArrayTable;
-    let dir = rbitcoin_store::testutil::TempDir::labeled("ahead-shapes").unwrap();
-    let path = dir.path().join("table");
-    let logical = 8192u64;
-    let good = ahead_rec(4096, &[7u8; 8]);
-    let page0 = ahead_rec(16, &[3u8; 16]);
-    let ok = ahead_raw(1, 2, ahead_header(logical), &[page0, good.clone()]);
-
-    let cases = [
-        ahead_raw(1, 0, ahead_header(logical), &[]),
-        ahead_raw(2, 1, ahead_header(logical), std::slice::from_ref(&good)),
-        ahead_raw(1, 2, ahead_header(logical), std::slice::from_ref(&good)),
-        ahead_raw(1, 1, ahead_header(logical), &[vec![0u8; 10]]),
-        ahead_raw(1, 1, ahead_header(logical), &[ahead_rec(0, &[1u8; 8])]),
-        ahead_raw(
-            1,
-            1,
-            ahead_header(logical),
-            &[ahead_rec(logical, &[1u8; 8])],
-        ),
-    ];
-    for raw in cases {
-        std::fs::write(ahead_side(&path), raw).unwrap();
-        assert!(ArrayTable::restore_ahead_for_test(&path, true).is_err());
-    }
-    let mut bad_sum = good.clone();
-    bad_sum[12] ^= 1;
-    std::fs::write(
-        ahead_side(&path),
-        ahead_raw(1, 1, ahead_header(logical), &[bad_sum]),
-    )
-    .unwrap();
-    assert!(ArrayTable::restore_ahead_for_test(&path, true).is_err());
-    let mut trailing = ok.clone();
-    trailing.push(0);
-    std::fs::write(ahead_side(&path), trailing).unwrap();
-    assert!(ArrayTable::restore_ahead_for_test(&path, true).is_err());
-    let mut bad_magic = ok.clone();
-    bad_magic[0] ^= 1;
-    std::fs::write(ahead_side(&path), bad_magic).unwrap();
-    assert!(ArrayTable::restore_ahead_for_test(&path, true).is_err());
-
-    std::fs::write(ahead_side(&path), ok).unwrap();
-    ArrayTable::restore_ahead_for_test(&path, false).unwrap();
-    assert!(ahead_side(&path).exists());
-    ArrayTable::restore_ahead_for_test(&path, true).unwrap();
-    assert!(!ahead_side(&path).exists());
-    assert!(std::fs::read(&path).unwrap().len() >= 4104);
-    let _ = std::fs::remove_dir_all(dir.path());
+fn fd_write_refuses_while_an_earlier_mark_is_armed() {
+    let dir = tmp_path();
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("slots.body");
+    let file = rbitcoin_store::file::TableFile::create(&path, TableKind::ArrayLink).unwrap();
+    file.write_at(ArrayTable::offset(0), &vec![0u8; 8 * 1100])
+        .unwrap();
+    drop(file);
+    let t =
+        with_class_c_inram_max_bytes(0, || ArrayTable::open(&path, TableKind::ArrayLink).unwrap());
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    rbitcoin_store::chain::fail_next_fd_write_before_live(&path);
+    assert!(t.set(&write, 0, 7).is_err());
+    let mark = dir.join("guard/class_c");
+    assert!(mark.is_file());
+    let armed = std::fs::read(&mark).unwrap();
+    assert!(
+        matches!(t.set(&write, 1000, 9), Err(StoreError::Rejected(_))),
+        "a later fd write went ahead over an armed mark"
+    );
+    assert_eq!(std::fs::read(&mark).unwrap(), armed);
+    drop(t);
+    let _ = std::fs::remove_dir_all(&dir);
 }

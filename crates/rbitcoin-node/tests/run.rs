@@ -358,6 +358,59 @@ async fn onion_seednode_reaches_socks_from_operator_config() {
     );
 }
 
+/// A task that fails once the node is running stops it through the shutdown
+/// tail, so the store flush still syncs a dirty scripthash index. Returning
+/// early skipped it and the next start was refused (#2138). The first
+/// mempool task is the one tip entry runs; the second is the first perf tick
+/// in the tip-follow loop. A failed run binds no SV2 listener.
+#[tokio::test]
+async fn a_failed_task_mid_run_still_runs_the_shutdown_tail() {
+    for (skip, in_loop) in [(0, false), (1, true)] {
+        let dir = rbitcoin_store::testutil::TempDir::new().unwrap();
+        let mut cfg = tiny_regtest(dir.path());
+        cfg.apply_kv("milestone", "0").unwrap();
+        cfg.apply_kv("listen", "0").unwrap();
+        cfg.apply_kv("max_inbound", "0").unwrap();
+        cfg.listen.use_seeds = false;
+        cfg.max_run_secs = Some(30);
+        cfg.apply_kv("sv2_tp_listen", "127.0.0.1:0").unwrap();
+        cfg.apply_kv(
+            "sv2_tp_authority_sec",
+            "zmBEmPhqo3A92FkiLVvyCz6htc3e53ph3ZbD4ASqGaLjwnFLi",
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        arm_fail_mempool_task(skip);
+        rbitcoin_log::capture_logs(true);
+        let ran = tokio::time::timeout(Duration::from_secs(45), run_p2p(cfg))
+            .await
+            .expect("the failed task stops the run");
+        let lines = rbitcoin_log::take_logs();
+        rbitcoin_log::capture_logs(false);
+        let err = ran.expect_err("the failed task is the exit error");
+        assert!(err.to_string().contains("armed"), "skip={skip}: {err}");
+        let logged = |text: &str| lines.iter().any(|(_, l)| l.contains(text));
+        assert_eq!(
+            logged("catch-up complete"),
+            in_loop,
+            "skip={skip}: {lines:?}"
+        );
+        assert!(
+            logged("node: store flushed") || logged("node: flush warning"),
+            "skip={skip}: no store flush in {lines:?}"
+        );
+        assert!(
+            logged("node: shutdown steps"),
+            "skip={skip}: no tail in {lines:?}"
+        );
+        assert_eq!(
+            logged("sv2 TP on"),
+            in_loop,
+            "skip={skip}: SV2 binds only on a run that reached the loop: {lines:?}"
+        );
+    }
+}
+
 #[test]
 fn follow_dial_targets_keeps_i2p_connect() {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -1890,6 +1943,56 @@ fn startup_reports_a_tweak_repair_that_cannot_read_the_keep_file() {
         err.to_string().contains("index startup repair failed"),
         "{err}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A store flush that fails at exit fails the stop, so the process exits
+/// non-zero and a service manager sees it (#2144 review).
+#[test]
+fn a_failed_store_flush_at_exit_is_the_exit_error() {
+    use rbitcoin_primitives::{Fk, Height};
+    use rbitcoin_query::testutil::FixtureChain;
+    use rbitcoin_query::TxApply;
+    use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+
+    let dir = scratch_dir("exit-flush-fails");
+    let q = Query::open_or_create_tiny(&dir).unwrap();
+    q.set_prune_seqsigwit(true).unwrap();
+    let mut txid = [0u8; 32];
+    txid[31] = 0xcc;
+    let ta = TxApply {
+        tx: TxRecord {
+            txid,
+            version: 1,
+            locktime: 0,
+            input_count: 1,
+            output_count: 1,
+        },
+        inputs: vec![InputRecord::coinbase(
+            u32::MAX,
+            vec![0x04, 1],
+            vec![vec![0x22]],
+        )],
+        outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
+    };
+    let header = HeaderRecord {
+        prev_fk: Fk::NULL,
+        version: 1,
+        timestamp: 1,
+        bits: 0x207f_ffff,
+        nonce: 0,
+        merkle_root: txid,
+        hash: txid,
+        size: 0,
+        weight: 0,
+    };
+    q.connect_block(Height(0), &header, &[ta]).unwrap();
+    q.clear_seqsigwit_ram_window();
+    std::fs::remove_file(q.store().path().join("seqsigwit.window/0.bin")).unwrap();
+
+    let shutdown = Shutdown::new();
+    flush_store_for_exit(&q, &shutdown);
+    assert!(shutdown.result().is_err(), "a failed store flush exited 0");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

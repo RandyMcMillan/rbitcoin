@@ -6,7 +6,7 @@
 CI pins **rustc 1.95.0**; [`rust-toolchain.toml`](./rust-toolchain.toml) makes
 [rustup](https://rustup.rs) install that channel (plus `rustfmt` and `clippy`)
 the first time you run `cargo` in this tree. [`rust-forward.toml`](./rust-forward.toml)
-is the newer compiler the `rust-forward` job checks. It is not the compiler
+is the newer compiler the `toolchains` job checks. It is not the compiler
 you develop with. Later pulls move that channel forward.
 
 Operator Linux binaries stay the musl path in [`README.md`](./README.md) /
@@ -273,13 +273,14 @@ Do not edit [`CHANGELOG.md`](./CHANGELOG.md) on a feature branch. The release
 cut folds those files in. Owner: [`docs/releases.md`](./docs/releases.md).
 
 Required **jobs** match [`.github/workflows/ci.yml`](./.github/workflows/ci.yml)
-(`qc`, `test`, `windows`, `macos`, `coverage`, `pread`, `rust-forward`).
-`qc` is fmt, ast-grep, unwrap-ratchet, hex-ratchet, deny,
-the script self-tests, then clippy, on one runner. `pread` is the
+(`qc`, `test`, `windows`, `macos`, `coverage`, `pread-release`, `toolchains`).
+`qc` is fmt, ast-grep, unwrap-ratchet, hex-ratchet, page-write-ratchet, deny,
+the script self-tests, then clippy, on one runner. `pread-release` runs the
 Linux libc backend for `rbitcoin-store` and `rbitcoin-query`
-(`RBITCOIN_IO=pread`). `rust-forward` is `cargo check --workspace --all-targets`
-on the channel in [`rust-forward.toml`](./rust-forward.toml). `pread`,
-`rust-forward`, and `nixos-module-eval` start with `coverage`, after `qc` and
+(`RBITCOIN_IO=pread`), then `cargo check --release` and `cargo doc`.
+`toolchains` is the fuzz-run self-test, then `cargo check --workspace --all-targets`
+on the channel in [`rust-forward.toml`](./rust-forward.toml). `pread-release`,
+`toolchains`, and `nixos-module-eval` start with `coverage`, after `qc` and
 `test`. The module eval does not gate `coverage`. It is not a Protected
 status check until the ruleset names `nixos-module-eval`. `macos-test` runs
 the workspace suite on `macos-26` with `--features skip-flushes`. It starts

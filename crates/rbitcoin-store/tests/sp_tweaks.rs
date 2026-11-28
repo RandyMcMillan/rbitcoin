@@ -544,3 +544,165 @@ fn read_offs_run_reads_the_next_slot() {
         "{err:?}"
     );
 }
+
+/// A failed put publishes nothing to readers, and readers keep the old
+/// prefix. Truncate and trim wait for reopen too, as the next put does: one
+/// length may be durable and the other not.
+#[test]
+#[cfg(debug_assertions)]
+fn a_failed_put_stays_out_of_reads_and_blocks_cuts() {
+    let dir = tmp_dir();
+    let t = SpTweaksTable::create(&dir, Height(0)).unwrap();
+    let mut tweak = [0u8; 33];
+    tweak[0] = 0x02;
+    t.put_block(Height(0), &[Some(tweak)]).unwrap();
+    {
+        let inner = t.inner.lock().unwrap();
+        let idx = &inner.segs.last().unwrap().idx;
+        rbitcoin_store::io_handle::arm_fail_sync(idx.io_handle(), 1);
+    }
+    assert!(t.put_block(Height(1), &[Some(tweak)]).is_err());
+    assert_eq!(t.next_height(), Height(1));
+    assert!(t.get_block(Height(1), 1).unwrap().is_none());
+    assert_eq!(t.get_block(Height(0), 1).unwrap(), Some(vec![Some(tweak)]));
+    assert!(matches!(
+        t.truncate_keep_slots(0),
+        Err(rbitcoin_store::StoreError::Rejected(_))
+    ));
+    assert!(matches!(
+        t.trim_last_record(1),
+        Err(rbitcoin_store::StoreError::Rejected(_))
+    ));
+    assert_eq!(t.get_block(Height(0), 1).unwrap(), Some(vec![Some(tweak)]));
+}
+
+/// A crash can leave the body length durable and the idx length old. The
+/// last-record fit cuts the body back, and the next put lands after it.
+#[test]
+fn the_fit_cuts_a_body_length_published_before_its_idx() {
+    let dir = tmp_dir();
+    let t = SpTweaksTable::create(&dir, Height(0)).unwrap();
+    let mut tweak = [0u8; 33];
+    tweak[0] = 0x02;
+    t.put_block(Height(0), &[Some(tweak)]).unwrap();
+    let idx_path = t
+        .inner
+        .lock()
+        .unwrap()
+        .segs
+        .last()
+        .unwrap()
+        .idx
+        .path()
+        .to_path_buf();
+    let mut old_header = [0u8; FILE_HEADER_LEN];
+    fs::File::open(&idx_path)
+        .unwrap()
+        .read_exact(&mut old_header)
+        .unwrap();
+    t.put_block(Height(1), &[Some(tweak)]).unwrap();
+    drop(t);
+    // The crash came after the body length and before the idx length.
+    let mut idx = fs::OpenOptions::new().write(true).open(&idx_path).unwrap();
+    idx.write_all(&old_header).unwrap();
+    drop(idx);
+    let t = SpTweaksTable::open(&dir).unwrap();
+    assert_eq!(t.next_height(), Height(1));
+    // Query open fits the last record to its block's `n_tx` before any use.
+    assert_eq!(t.trim_last_record(1).unwrap(), TrimLast::Cut);
+    assert_eq!(t.get_block(Height(0), 1).unwrap(), Some(vec![Some(tweak)]));
+    let mut other = tweak;
+    other[1] = 0x77;
+    t.put_block(Height(1), &[Some(other)]).unwrap();
+    drop(t);
+    let t = SpTweaksTable::open(&dir).unwrap();
+    assert_eq!(t.get_block(Height(1), 1).unwrap(), Some(vec![Some(other)]));
+    assert_eq!(t.get_block(Height(0), 1).unwrap(), Some(vec![Some(tweak)]));
+}
+
+/// A put that fails after its body length is published still leaves the old
+/// last record readable: its end is the body length.
+#[test]
+#[cfg(debug_assertions)]
+fn a_put_failing_after_the_body_length_keeps_the_old_tip_readable() {
+    let dir = tmp_dir();
+    let t = SpTweaksTable::create(&dir, Height(0)).unwrap();
+    let mut tweak = [0u8; 33];
+    tweak[0] = 0x02;
+    t.put_block(Height(0), &[Some(tweak)]).unwrap();
+    let old_len = t.body_logical_len();
+    {
+        let inner = t.inner.lock().unwrap();
+        let idx = &inner.segs.last().unwrap().idx;
+        rbitcoin_store::io_handle::arm_fail_flush(idx.io_handle(), 1);
+    }
+    assert!(t.put_block(Height(1), &[Some(tweak)]).is_err());
+    assert_eq!(t.next_height(), Height(1));
+    assert_eq!(t.get_block(Height(0), 1).unwrap(), Some(vec![Some(tweak)]));
+    // The rollback is RAM-only. The body header keeps the length the commit
+    // published, so it cannot fall below an idx length that landed.
+    t.flush().unwrap();
+    let raw = std::fs::read(SpTweaksTable::body_dir(&dir).join("000000")).unwrap();
+    let on_disk = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+    assert!(on_disk > old_len, "the rollback shortened the body header");
+}
+
+/// A new table's `meta` and its two directories are durable before the
+/// first put can return. A put syncs only the segment files and their own
+/// directories.
+#[cfg(all(unix, debug_assertions))]
+#[test]
+fn create_syncs_the_new_table_directories() {
+    let dir = tmp_dir();
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    let _t = SpTweaksTable::create(&dir, Height(0)).unwrap();
+    let synced = rbitcoin_store::file::take_fsynced_dirs();
+    for want in [
+        dir.to_path_buf(),
+        SpTweaksTable::idx_dir(&dir),
+        SpTweaksTable::body_dir(&dir),
+    ] {
+        assert!(
+            synced.contains(&want),
+            "{} was not synced, got {synced:?}",
+            want.display()
+        );
+    }
+}
+
+/// A tweak put is an append under the sector rule. It arms no mark.
+#[test]
+fn a_tweak_put_arms_no_mark() {
+    let dir = tmp_dir();
+    let t = SpTweaksTable::create(&dir, Height(0)).unwrap();
+    let mut tweak = [0u8; 33];
+    tweak[0] = 0x02;
+    t.put_block(Height(0), &[Some(tweak)]).unwrap();
+    t.put_block(Height(1), &[None, Some(tweak)]).unwrap();
+    assert!(!dir.join("guard").exists(), "a tweak put armed a mark");
+    assert_eq!(
+        t.get_block(Height(1), 2).unwrap(),
+        Some(vec![None, Some(tweak)])
+    );
+}
+
+/// A first create that fails after its directories exist leaves no `meta`,
+/// so the next `open_or_create` starts the table again instead of refusing a
+/// table with no pairs.
+#[test]
+fn a_failed_first_create_is_retried_by_open_or_create() {
+    let dir = tmp_dir();
+    let dirs = SpTweaksTable::seg_dirs(&dir);
+    // A directory where body 000000 goes: pair 000000 cannot be made.
+    fs::create_dir_all(dirs.body_path(0)).unwrap();
+    assert!(SpTweaksTable::create(&dir, Height(5)).is_err());
+    assert!(
+        !SpTweaksTable::files_present(&dir),
+        "a failed create left meta"
+    );
+    let t = SpTweaksTable::open_or_create(&dir, Height(5)).expect("the retried create");
+    t.put_block(Height(5), &[None]).unwrap();
+    drop(t);
+    let t = SpTweaksTable::open_or_create(&dir, Height(5)).unwrap();
+    assert_eq!(t.next_height(), Height(6));
+}

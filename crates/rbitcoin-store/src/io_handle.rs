@@ -92,6 +92,10 @@ impl IoHandle {
         if let Some(r) = injected_sync(self) {
             return r;
         }
+        #[cfg(debug_assertions)]
+        if take_fail_sync_on_thread() {
+            return -5;
+        }
         #[cfg(unix)]
         // SAFETY: the caller keeps the fd open; `ManuallyDrop` never closes it.
         let file = std::mem::ManuallyDrop::new(unsafe {
@@ -125,7 +129,7 @@ impl IoHandle {
             return -disk_full_errno();
         }
         #[cfg(debug_assertions)]
-        if buf.len() > 8 && short_pwrite_armed(self) {
+        if buf.len() > 8 && (short_pwrite_armed(self) || take_short_pwrite_len(buf.len())) {
             let n = self.pwrite_sys(offset, &buf[..8]);
             if n < 0 {
                 return n;
@@ -171,6 +175,11 @@ static FAIL_HWM: std::sync::Mutex<Vec<(IoHandle, u32)>> = std::sync::Mutex::new(
 /// Next N `sync_data` calls on these read fds fail before the syscall.
 #[cfg(debug_assertions)]
 static FAIL_SYNC: std::sync::Mutex<Vec<(IoHandle, u32)>> = std::sync::Mutex::new(Vec::new());
+
+/// Next N whole-table flushes (`TableFile::flush`) on these fds fail before
+/// their sync. Separate from [`FAIL_SYNC`], which a table flush leaves armed.
+#[cfg(debug_assertions)]
+static FAIL_FLUSH: std::sync::Mutex<Vec<(IoHandle, u32)>> = std::sync::Mutex::new(Vec::new());
 
 /// Ignore this many `sync_data` calls on these fds before [`FAIL_SYNC`] counts.
 #[cfg(debug_assertions)]
@@ -283,6 +292,7 @@ pub fn disarm_short_pwrite() {
         .clear();
     FAIL_HWM.lock().unwrap_or_else(|e| e.into_inner()).clear();
     FAIL_SYNC.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    FAIL_FLUSH.lock().unwrap_or_else(|e| e.into_inner()).clear();
     SYNC_SKIP.lock().unwrap_or_else(|e| e.into_inner()).clear();
     SYNC_DELAY.lock().unwrap_or_else(|e| e.into_inner()).clear();
     FAIL_PREAD.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -310,6 +320,10 @@ pub fn disarm_pwrite(handle: IoHandle) {
         .unwrap_or_else(|e| e.into_inner())
         .retain(|(h, _)| *h != handle);
     FAIL_SYNC
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(h, _)| *h != handle);
+    FAIL_FLUSH
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .retain(|(h, _)| *h != handle);
@@ -392,6 +406,80 @@ fn take_fail_pread_len(len: usize) -> bool {
     })
 }
 
+/// Make the next `n` pwrites of `len` bytes on this thread write 8 bytes and
+/// return disk-full.
+///
+/// Open restores a legacy page image through an fd the test never holds.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn arm_short_pwrite_len(len: usize, n: u32) {
+    SHORT_PWRITE_LEN.with(|slot| slot.set((len, n)));
+}
+
+/// Fail the next `n` [`IoHandle::durable_sync_data`] calls on this thread.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn arm_fail_sync_on_thread(n: u32) {
+    FAIL_SYNC_ON_THREAD.with(|slot| slot.set(n));
+}
+
+/// Fail the next `n` [`crate::file::fsync_parent_dir`] calls on this
+/// thread, after the rename or unlink they follow has run.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn arm_fail_dir_sync_on_thread(n: u32) {
+    FAIL_DIR_SYNC_ON_THREAD.with(|slot| slot.set(n));
+}
+
+/// Clear [`arm_short_pwrite_len`], [`arm_fail_sync_on_thread`], and
+/// [`arm_fail_dir_sync_on_thread`] on this thread.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn disarm_thread_writes() {
+    SHORT_PWRITE_LEN.with(|slot| slot.set((0, 0)));
+    FAIL_SYNC_ON_THREAD.with(|slot| slot.set(0));
+    FAIL_DIR_SYNC_ON_THREAD.with(|slot| slot.set(0));
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static SHORT_PWRITE_LEN: std::cell::Cell<(usize, u32)> = const { std::cell::Cell::new((0, 0)) };
+    static FAIL_SYNC_ON_THREAD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static FAIL_DIR_SYNC_ON_THREAD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(debug_assertions)]
+fn take_short_pwrite_len(len: usize) -> bool {
+    SHORT_PWRITE_LEN.with(|slot| {
+        let (want, n) = slot.get();
+        if n == 0 || want != len {
+            return false;
+        }
+        slot.set((want, n - 1));
+        true
+    })
+}
+
+#[cfg(debug_assertions)]
+fn take_fail_sync_on_thread() -> bool {
+    FAIL_SYNC_ON_THREAD.with(take_one)
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn take_fail_dir_sync_on_thread() -> bool {
+    FAIL_DIR_SYNC_ON_THREAD.with(take_one)
+}
+
+#[cfg(debug_assertions)]
+fn take_one(slot: &std::cell::Cell<u32>) -> bool {
+    let n = slot.get();
+    if n == 0 {
+        return false;
+    }
+    slot.set(n - 1);
+    true
+}
+
 /// Fail the next `n` preads on `handle` before any byte is returned.
 #[cfg(debug_assertions)]
 #[doc(hidden)]
@@ -409,6 +497,10 @@ pub fn arm_fail_preads(handle: IoHandle, n: u32) {
 #[doc(hidden)]
 pub fn disarm_sync(handle: IoHandle) {
     FAIL_SYNC
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(h, _)| *h != handle);
+    FAIL_FLUSH
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .retain(|(h, _)| *h != handle);
@@ -460,7 +552,30 @@ pub(crate) fn take_fail_sync(handle: IoHandle) -> bool {
             }
         }
     }
-    let mut slots = FAIL_SYNC.lock().unwrap_or_else(|e| e.into_inner());
+    take_armed(&FAIL_SYNC, handle)
+}
+
+/// Fail the next `n` whole-table flushes of the file behind `handle`.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn arm_fail_flush(handle: IoHandle, n: u32) {
+    let mut slots = FAIL_FLUSH.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(slot) = slots.iter_mut().find(|(h, _)| *h == handle) {
+        slot.1 = n;
+    } else {
+        slots.push((handle, n));
+    }
+}
+
+/// One armed table flush on `handle` is consumed. Unarmed fds are untouched.
+#[cfg(debug_assertions)]
+pub(crate) fn take_fail_flush(handle: IoHandle) -> bool {
+    take_armed(&FAIL_FLUSH, handle)
+}
+
+#[cfg(debug_assertions)]
+fn take_armed(arms: &std::sync::Mutex<Vec<(IoHandle, u32)>>, handle: IoHandle) -> bool {
+    let mut slots = arms.lock().unwrap_or_else(|e| e.into_inner());
     let Some(i) = slots.iter().position(|(h, _)| *h == handle) else {
         return false;
     };

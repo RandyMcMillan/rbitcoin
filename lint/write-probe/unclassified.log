@@ -1,0 +1,1 @@
+PROBE MULTI_SECTOR store/confirmed.body rbitcoin_store::array_table::ArrayTable::write end=9000 off=600 len=1024

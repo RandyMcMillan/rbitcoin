@@ -1,5 +1,22 @@
 # Storage and indexes
 
+## Drives
+
+Run the datadir on an SSD that keeps flushed writes on power loss. NVMe
+promises a power-fail atomic write only for a command no larger than the
+drive's atomic write unit (`awupf` in `nvme id-ctrl`, at least one logical
+block). The kernel can write back larger commands, and for those the
+specification promises nothing, whatever the format: the store then relies
+on the drive keeping each block old or new. A 4 KiB logical block format
+(`nvme id-ns`) keeps each block a whole page; prefer it where the drive
+offers one. Whether a
+consumer drive honors a flush varies by model: in a 2022 power-cut test the
+Samsung 970 EVO Plus and WD Red SN700 kept flushed data, while the SK hynix
+Gold P31 and Sabrent Rocket lost it. Drives with power-loss protection are
+safe by design. A drive that loses flushed writes can leave a store that
+refuses to open after a power cut, and recovery is a reindex. See
+[`../crash-recovery.md`](../crash-recovery.md) (the sector rule).
+
 ## Bulk store IO backends
 
 **Bulk batch** uses a **single** switch: `RBITCOIN_IO=uring|pool|iocp|pread` (default uring
@@ -230,6 +247,22 @@ Core `-txindex` (we always keep Class A + `tx.head` for by-txid lookup).
 | **off (default)** | No SH run enqueue during IBD; no tip bulk materialize. Tip follow + mempool relay + JSON-RPC work without SH. |
 | **on** (`--sh-index` / `sh_index=1`) | Direct IBD defers SH. Tip entry runs two Class A scans, then pack and seal; write-behind follows. Address/scripthash Electrum/Esplora methods work after that seal. |
 
+**A crash during an index write refuses the next start.** Some index writes
+land in place, so the node marks `store/scripthash.dirty` before it writes and
+removes the mark once those bytes are synced (about every second while the
+index catches up, and at a clean shutdown). If the process dies in between (a
+kill -9, an out-of-memory kill or a power cut), the next start with
+`--sh-index` exits with a "torn write" error, because the index can read as
+valid and be wrong. A mark left by an index write that failed (a full disk,
+say) is the exception to the sync: no sync removes it, so a clean shutdown
+keeps it and the next start refuses the same way. Start once with
+`RBITCOIN_SH_FORCE_REBUILD=1` to rebuild it from Class A. That takes hours on
+mainnet, but the chain is not touched.
+Under systemd, `Restart=always` repeats any failed start, so check the log
+for the "torn write" error before forcing a rebuild. Give a
+clean stop room to finish (`TimeoutStopSec`): the shutdown flush syncs the
+index first.
+
 Electrum/Esplora **start without** `--sh-index`. Address/scripthash methods then fail closed (`scripthash index disabled`). Txid/outpoint/block/fees still work. Matrix: [`docs/lightning.md`](../../docs/lightning.md).
 
 `--esplora-block-template` (conf `esplora_block_template=1`) enables
@@ -315,7 +348,7 @@ to start over unless you intend a full Class A collect
 | All `.packed`, neither mark, Class A has creates | Delete the head and materialize from Class A. A block-by-block replay from height 0 is not the rebuild. |
 | Complete head, no marks, no extract | Soft-migrate: write `.packed`. Missing `include_hwm` is set from the create count. |
 | Kill-9 mid pack | Unfinished shard is redone. Open follows [`docs/crash-recovery.md`](../crash-recovery.md). |
-| Write-behind IO error (disk full) | The process exits non-zero after the shutdown flush. Restart the same datadir; write-behind continues. |
+| Write-behind IO error (disk full) | The process exits non-zero after the shutdown flush. Free space and restart the same datadir; write-behind continues. If that start exits with the "torn write" error, the failed write left `store/scripthash.dirty`, which the clean shutdown does not remove: start once with `RBITCOIN_SH_FORCE_REBUILD=1`. |
 | Corrupt SH (mixed body, refuse line) | Wipe `store/scripthash*` only, keep Class A, rematerialize with `--sh-index`. Leftover live OA is removed on open. |
 
 Electrum waits until SH is tip-ready. Do **not** `rm -rf store/` for an SH

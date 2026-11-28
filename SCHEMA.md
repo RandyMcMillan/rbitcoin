@@ -1,7 +1,7 @@
 # On-disk schema (current)
 
-**Version:** `SCHEMA_VERSION = 30` (`rbitcoin_primitives`).
-**Status:** 30 replaces the `spend.pages` image log with a schema-30 spend delta that records every spend slot. `spent.body` keeps its layout but is sparse: Class A writes none of its bytes, and only a fold writes its pages. `store/spent.delta/` holds page records in capped segments, a page directory written as a base plus a log of one batch per generation, and the commit that names the snapshot. Old segments fold into `spent.body`. A 29 binary would read stale `spent.body` and miss the delta, so it refuses 30 `meta`. Opening any 22–29 datadir here rewrites `meta` to 30, publishes a committed schema-29 page log as the delta's first generation, and removes the 29 files. A 29 binary then refuses the directory. 29 records which generation file held each `spend.pages` image; it is read once, at that open. 28 rewrites `meta` only. `--prune-seqsigwit` can leave `seqsigwit` at a header while creates remain. A 26 binary treats that empty locator as damage and truncates the chain. A 27 binary refuses 28 `meta`. A 0.9.0 binary refuses it too. 26 is `header.body` 88 B (consensus fields only). Occupied 24/25
+**Version:** `SCHEMA_VERSION = 31` (`rbitcoin_primitives`).
+**Status:** 31 adds page-guard marks under `store/guard/` and changes no table. Opening a 22–30 datadir rewrites `meta` to 31, so a 30 binary refuses it. 30 replaces the `spend.pages` image log with a schema-30 spend delta that records every spend slot. `spent.body` keeps its layout but is sparse: Class A writes none of its bytes, and only a fold writes its pages. `store/spent.delta/` holds page records in capped segments, a page directory written as a base plus a log of one batch per generation, and the commit that names the snapshot. Old segments fold into `spent.body`. A 29 binary would read stale `spent.body` and miss the delta, so it refuses 30 `meta`. Opening any 22–29 datadir here rewrites `meta` to 30, publishes a committed schema-29 page log as the delta's first generation, and removes the 29 files. A 29 binary then refuses the directory. 29 records which generation file held each `spend.pages` image; it is read once, at that open. 28 rewrites `meta` only. `--prune-seqsigwit` can leave `seqsigwit` at a header while creates remain. A 26 binary treats that empty locator as damage and truncates the chain. A 27 binary refuses 28 `meta`. A 0.9.0 binary refuses it too. 26 is `header.body` 88 B (consensus fields only). Occupied 24/25
 rewrites each 96 B row down to 88 B (`header.body.grow` then rename), dropping
 the trailing `size:u32` + `weight:u32`. Block size and weight are summed from
 `txstat` for that header's create range. A 25 binary refuses 26 `meta`.
@@ -23,7 +23,7 @@ divisible by 10 is Corrupt; zero is `e=0`, mantissa 0). Meta older than 22
 is one refuse, empty or occupied: `schema before 22 refuses this datadir;
 wipe datadir and redo IBD`. That is the last time `tx.body`, `txout.body`,
 or `inwit.body` / `seqsigwit.body` had to be deleted rather than rewritten.
-`schema_file_openable` is 22 through 30. A 23 binary refuses 24 `meta`. A 26 binary refuses 27 `meta`. A 27 binary refuses 28 `meta`. A 28 binary refuses 29 `meta`. A 29 binary refuses 30 `meta`.
+`schema_file_openable` is 22 through 31. A 23 binary refuses 24 `meta`. A 26 binary refuses 27 `meta`. A 27 binary refuses 28 `meta`. A 28 binary refuses 29 `meta`. A 29 binary refuses 30 `meta`. A 30 binary refuses 31 `meta`.
 
 Operator copy-paste (which dirs to wipe; kill-9 is not a migrate):
 [`docs/operator/storage.md`](./docs/operator/storage.md#schema-upgrade).
@@ -86,7 +86,7 @@ index refuses flat tx.head.meta; wipe store/tx.head then restart (Class A kept; 
 index refuses Shared (file) scripthash.body; wipe store/scripthash* then restart (Class A kept; SH rematerializes with --sh-index)
 index refuses pack8 Paged (mode 10) scripthash heads; wipe store/scripthash* then restart (Class A kept; SH rematerializes with --sh-index)
 ```  
-Table file headers **22–30** remain `schema_file_openable`. A 22 binary refuses 23 `meta`.
+Table file headers **22–31** remain `schema_file_openable`. A 22 binary refuses 23 `meta`.
 **22→23 open:** occupied Class A rewrites `create.loc.ovf` 12 B rows (`fk:u64` + two u16) to 16 B (`fk:u64` + two u32) and `store/meta` to 30. Empty 22 rewrites `meta`. A 22 binary refuses 23 `meta`. Spent vin stays u16 (stripped input ≥ ~41 B ⇒ ≲24k vins in a 1 MB block; widening would bump the 8 B spent slot).
 **23→24 open** (schema 24/25 binaries): rewrote `header.body` 88 B rows to 96 B. This binary does not expand. An 88 B body stays 88 B and `meta` rewrites to 30.
 **24/25→26 open:** rewrite each 96 B `header.body` row to 88 B (drop trailing `size`/`weight`) via `header.body.grow` then rename; rewrite `meta` to 30. A body that is already 88 B is unchanged. A 25 binary refuses 26 `meta`. Crash with leftover `.grow` discards it and retries.
@@ -103,8 +103,8 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
 ## Schema 17 freeze
 
 Class A shape settled here at schema 17 and is still the live layout under
-the `SCHEMA_VERSION` at the top of this file (30). Schemas 18–30 already
-shipped. Meta 22–30 is what this binary opens (rules above). Earlier
+the `SCHEMA_VERSION` at the top of this file (31). Schemas 18–31 already
+shipped. Meta 22–31 is what this binary opens (rules above). Earlier
 layouts are history in
 [`SCHEMA_HISTORY.md`](./SCHEMA_HISTORY.md). A byte-incompatible change bumps
 from that live constant
@@ -132,7 +132,7 @@ catalogs, or 16-layout Class A with creates is **refused**.
 | Policy | Choice |
 |--------|--------|
 | Loc | One loc pair per create; `seqsigwit` is the fat stem (cold) and does not force `txout` splits. `tx.head` rolls the private table at 80% slots only. |
-| `strong_tx` | Always L2. **`confirmed`** and **`header_txs_*`** stay in RAM up to 256 MiB, then fd. |
+| `strong_tx` | Always L2. **`confirmed`** and **`header_txs_*`** stay in RAM up to 256 MiB, then fd. Open refuses a `header_txs` pair whose two lengths fall on different sides of that cap. |
 | `RWF_DONTCACHE` | **Not used.** Confirm notes every spend slot in the delta, and Class A writes no `spent.body` bytes; a fold writes whole pages that checkpoints soon read again. |
 
 ### New script kinds without a wipe
@@ -233,10 +233,12 @@ itself changed.
     seqsigwit.window/                # prune window: one {height}.bin per kept height. The only witness payload while seqsigwit.prune exists
     seqsigwit.reloc                  # optional: append-only files live under --datadir-cold/store
     class_a.synced                   # optional: u64 LE create count a spend commit or scripthash mark named after a Class A sync (missing = 0). Open keeps exactly max(this, the highest `header_txs` create). No SCHEMA_VERSION bump
-    tear_guard/first                 # one sealed 4 KiB image per Class A stem, written once after that page is full. No SCHEMA_VERSION bump
-    tear_guard/tail.0                # alternating partial-tail image and published lengths (generation 0 = unused). No SCHEMA_VERSION bump
-    tear_guard/tail.1                # the other tail slot. No SCHEMA_VERSION bump
-    *.ahead                          # transient write-ahead page image for confirmed, header_txs_*, header.head, txstat.body, scripthash ingest head (scripthash.ovf/ingest.ahead); removed after a successful flush. No SCHEMA_VERSION bump
+    guard/class_c                    # schema 31 sidecar: forward 4 KiB images for confirmed[], header_txs first+count, and strong_tx. One mark per flush group. Open copies every named image before any Class C read. Published after meta 31. No SCHEMA_VERSION bump
+    guard/header.body                # schema 31 sidecar: empty flag armed only by the first header.body append. Open then takes an empty header.head beside body rows as that append, indexes the rows, and removes the flag once the head names them. Later appends sync rows, then length, with no mark. Published after meta 31. No SCHEMA_VERSION bump
+    guard/header.head                # schema 31 sidecar: forward 4 KiB images for one header.head generation (its .mlt appends with no mark). Open copies them before any head read. Published after meta 31. No SCHEMA_VERSION bump
+    guard/sh-*                       # schema 31 sidecar: backward 4 KiB images for one scripthash commit (body pages, page 0, and head words). Open copies them before any scripthash read or sealed-overflow magic check. A mark that does not parse writes scripthash.rebuild and is removed instead of stopping open. Published after meta 31. No SCHEMA_VERSION bump
+
+    *.ahead                          # transient write-ahead page image for the scripthash ingest head (scripthash.ovf/ingest.ahead); removed after a successful flush. Open refuses a leftover confirmed.body.ahead, header_txs_first.body.ahead, header_txs_count.body.ahead, header.head.ahead, header.head.gN.ahead, or txstat.body.ahead instead of restoring it. No SCHEMA_VERSION bump
     scripthash.rebuild               # optional: one byte. The next start wipes and rebuilds the scripthash index; removed when that rebuild finishes. No SCHEMA_VERSION bump
     scripthash.dirty                 # optional: one byte while scripthash writes may be unsynced. A --sh-index start that finds it refuses; a wipe removes it. No SCHEMA_VERSION bump
     spent.body                                              # sole-spender 8 B × n_out; leftover spent.off unlinked
@@ -270,7 +272,9 @@ itself changed.
     sp_tweaks.idx/  sp_tweaks.body/   # optional BIP-352 (schema 17 dirs; leftover files unlinked)
     blockfilter.idx/meta              # optional BIP158 basic (`--block-filter-index`): fmt:u32=1
     blockfilter.idx/NNNNNN            # 80 B slot per height from 0: off:u32 ‖ len:u32 ‖ header_fk:u64 ‖ filter_hash[32] ‖ filter_header[32]
-    blockfilter.body/NNNNNN           # filter bytes (Core `BlockFilter` content), records back to back, no prefix; new NNNNNN pair when the next start passes u32. Commit: body sync, then idx sync, then publish. Open keeps the slot prefix whose records run back to back inside the body, cuts the body to its end, and drops slots whose header_fk is not confirmed[h]. Missing dirs: index off / not built
+    blockfilter.body/NNNNNN           # filter bytes (Core `BlockFilter` content), records back to back, no prefix; new NNNNNN pair when the next start passes u32. Commit: an append with no mark (body bytes, then idx bytes, synced; then the body length, then the idx length, each synced). Open keeps the slot prefix whose records run back to back inside the body, cuts the body to its end, and drops slots whose header_fk is not confirmed[h]. Missing dirs: index off / not built
+
+  mempool/guard/flush              # one forward 4 KiB mark for a mempool flush: new LIVE slots, durable DEAD bytes, and meta (tx.body appends and publishes its length before the mark). tx.body is not renamed. No SCHEMA_VERSION bump
 
 <datadir-cold>/                  # only when --datadir-cold is set
   store/
@@ -284,7 +288,8 @@ itself changed.
 `--datadir` holds every file by default. `--datadir-cold PATH` places the
 files the IBD pin path does not read under `PATH/store/` and writes
 `seqsigwit.reloc` in the hot store: `seqsigwit.*`, `txstat.*`, `input.*`,
-and, once those indexes exist, `blockfilter.*` and `sp_tweaks.*`. Pin / SH /
+and, once those indexes exist, `blockfilter.*` and `sp_tweaks.*`. Those
+are appends and keep no guard mark. Pin / SH /
 spend-annotate stay on the hot volume. `--prune-seqsigwit` is separate: witness
 for the last 288 heights is only `seqsigwit.window/{height}.bin` on the hot
 store, and the stem stays a header (an archive enable copies that window out
@@ -302,7 +307,7 @@ and cuts it). `txout`, `txstat`, `input`, block filters, and tweaks are not prun
 | Offset | Size | Field |
 |--------|------|-------|
 | 0 | 4 | Magic `RBT1` |
-| 4 | 2 | Schema version (u16) — live **30** (`SCHEMA_VERSION`). Occupied files keep the version they were written; **22–30** remain `schema_file_openable` |
+| 4 | 2 | Schema version (u16) — live **31** (`SCHEMA_VERSION`). Occupied files keep the version they were written; **22–31** remain `schema_file_openable` |
 | 6 | 2 | Table kind (u16) |
 | 8 | 8 | Logical length (bytes), including this header |
 
@@ -682,8 +687,10 @@ single-file, `header_fk` + absolute off) are unlinked on store open.
 
 Reorg: truncate slots above the new tip (same era as SH HWM).
 
-Durability: each put writes and syncs the body, then writes and syncs the
-idx, so an idx slot on disk never points at body bytes a power cut can lose.
+Durability: a put is an append with no mark (crash-recovery.md, the sector
+rule). Body and idx bytes are synced, then the body length, then the idx
+length, so an idx slot on disk never points at body bytes a power cut can
+lose.
 Open (and first enable) repairs a crash tail: slots above the tip (a
 disconnect whose truncate never ran) are dropped, then the last record is fit
 to its `n_tx` — body bytes past it are cut, and a short record drops its slot.
@@ -698,11 +705,11 @@ bits-widen / shadow-resize path. Module map: [`docs/heads.md`](./docs/heads.md).
 
 | Property | Current |
 |----------|---------|
-| Files | `tx.head/meta` (**v2**: per-segment `sealed` and `tagged` flags) + shutdown snapshot `tx.head/NNNNNN` while that segment is unsealed; sealed `NNNNNN.mphf` + `.fuse8` |
+| Files | `tx.head/meta` (**v2**: per-segment `sealed`, `tagged`, and `mlt` flags) + shutdown snapshot `tx.head/NNNNNN` while that segment is unsealed; sealed `NNNNNN.mphf` + `.fuse8` + `.mlt` |
 | Default | **BITS=25**, **4 B** entries → **128 MiB** per segment (`2^25` slots) |
 | Bits | Tiny **16**, otherwise **25**. No process env. The entry is always 4 B; a footer that says 8 B **refuses** (`tx.head footer entry width`) |
 | Entry | LE u32 word `rel \| fp << bits`. Low `bits`: **relative** create id, **0 = empty**, `fk = first_fk + rel − 1`. Spare high bits: fingerprint of the mixed key, `1..=2^(32−bits)−1`; **0 = untagged**, matches every key. No fingerprint at bits 32 |
-| Meta v1 → v2 | A v1 meta **opens** (no refuse). Its unsealed slots carry fingerprint 0; open writes each slot's fingerprint from `txid.body` into the private table, writes the snapshot, then persists meta v2 with the segment `tagged`. A v1 binary refuses v2 meta (`tx.head.meta version`) and rebuilds `tx.head` from Class A |
+| Meta v1 → v2 | A v1 meta **opens** (no refuse). Its unsealed slots carry fingerprint 0; open writes each slot's fingerprint from `txid.body` into the private table, writes the snapshot, then persists meta v2 with the segment `tagged`. A v1 binary refuses v2 meta (`tx.head.meta version`) and rebuilds `tx.head` from Class A. The `mlt` flag (value 4) is set when seal renames `NNNNNN.mlt`, including an empty 4-byte image. A segment without the flag and no `.mlt` is an empty multi-list. The flag set with a missing or short file is unreadable (`tx.head mlt missing` / `tx.head mlt short`) and is not an index refuse: open wipes `tx.head` and rebuilds it from `txid.body`. No meta version bump |
 | Capacity | Segment ends at **80% of head slots** (`max_keys`) → open the next private table, seal the previous on a sidecar. Class A loc/body size does **not** cut `tx.head`. |
 | Seal filter | **Binary fuse8** (~9 bits/key, no false negatives, FP ≈ 0.39%) built **once on seal**; open segment has **no** filter |
 | Fuse file | `BF8R` + **version** + body. **v2** = in-tree LE layout (current). **v1** = historical xorf+bincode — **refused** (wipe `store/tx.head` and `store/scripthash*`; Class A kept) |

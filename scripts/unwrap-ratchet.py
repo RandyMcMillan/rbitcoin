@@ -81,10 +81,9 @@ def _string_end(src: str, i: int) -> int | None:
         if src[k] == "\\":
             k += 2
             continue
+        # A cooked string may span lines. Its `/*` or `//` is text.
         if src[k] == '"':
             return k + 1
-        if src[k] == "\n":
-            return None
         k += 1
     return n
 
@@ -216,7 +215,10 @@ def file_count(path: str, line_fn=bare_on_line) -> int:
             test_stack.pop()
         if depth < 0:
             depth = 0
-        prev = code.rstrip()
+        # A blank or comment-only line keeps the last code line as `prev`,
+        # so a call split across it still sees its name or receiver.
+        if stripped:
+            prev = code.rstrip()
     return n
 
 

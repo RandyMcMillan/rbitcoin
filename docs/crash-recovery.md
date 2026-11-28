@@ -30,22 +30,47 @@ transaction.
   whole because each is a synced temp file renamed over the old one.
   `tip_seal` only lowers a tip; it never raises one.
 - Class A keeps the highest create a durable `header_txs` range or
-  `class_a.synced` names, not the last bytes it finds. Page 0 is restored from
-  `tear_guard/first`; the partial tail block is restored from the alternating
-  `tear_guard/tail.0`/`tail.1` slots written with the stems before
-  `class_a.synced`. A leftover `{stem}.kept` from #1727 is applied on open as a
-  migration, not written by a current append.
-- Class C `confirmed[]`, `header_txs_*`, `header.head`, `txstat.body`, and the
-  scripthash ingest head write a synced `*.ahead` image of the intended pages
-  before an in-place write; open restores it before reading the table. An
+  `class_a.synced` names, not the last bytes it finds. An append writes past
+  the committed end; under the sector rule the sectors it shares with
+  committed rows land unchanged, and the barrier is the stem sync. No release wrote
+  `tear_guard/` or `{stem}.kept`, but a pre-0.10 master build did. Open
+  picks the page images to write back the way that build's open did and
+  saves that choice in a synced `tear_guard.plan` before it writes a stem.
+  It then writes and syncs the stems, removes the plan, syncs the hot
+  directory, and removes the images. An open after a failed write or sync
+  syncs the plan's name again and repeats the plan. An image or plan that
+  holds bytes but does not decode stops open with `Corrupt` and stays on
+  disk. The one exception is the tail: the build kept two tail slots, so
+  when one fails its checksum and the other decodes, open restores from the
+  good slot and removes both with the guard, as that build's open did.
+- Class C `confirmed[]`, `header_txs_*`, and `strong_tx` share one synced
+  `store/guard/class_c` mark of the intended 4 KiB pages before an in-place
+  write, and open copies its images back before reading those tables. An
   array flush always images page 0, because it rewrites the length there even
-  when a shrink writes no slot or empties the table.
+  when a shrink writes no slot or empties the table. Open refuses a legacy
+  `confirmed.body.ahead` or `header_txs_*.body.ahead` instead of restoring it.
+- `header.body` only appends: rows, then length, each synced before the
+  head insert. Only the first append arms `store/guard/header.body`, an empty
+  flag, because open refuses an empty head beside body rows. One
+  `header.head` generation uses `store/guard/header.head`. Its `.mlt` only
+  appends, and the rows and length are synced before that mark arms. Open
+  copies every named image before reading those files, and refuses a legacy
+  `header.head*.ahead`.
+- The scripthash ingest head writes its own synced `*.ahead` image, and open
+  restores it the same way.
+- A `txstat` stamp writes no image (the sector rule, below). Open refuses any
+  entry named `txstat.body.ahead`, or one it cannot stat, instead of
+  replaying it.
 - `confirmed[]` has no null slot below the tip open keeps: the lower of the
   tip and the sealed tip, less a trailing null run. A binary without the
   image rewrote the 4 KiB block that holds that tip on every barrier, so
   Store open cuts the tip below a null in that block. It refuses a null
   anywhere else before it builds the fence: a torn page comes back from its
-  image, so such a null is not crash damage. The fix is a reindex.
+  image, so such a null is not crash damage. The fix is a reindex. The cut
+  stays in RAM until the spend delta has adopted a pre-30 `spent.body`: its
+  flush is a mark, which moves `meta` to 31, and a 31 datadir with a
+  populated body and no `spent.delta/` refuses. A stop before that flush
+  cuts again at the next open.
 - The tip window re-reads every height above the durable marker `D`
   (`(D, tip]`) and at least the last six. A missing marker walks from genesis.
   A stored mismatch shrinks the tip to the last good height. An OS or
@@ -70,33 +95,194 @@ in-process tip; that is lost progress, not a wrong chain. Open does not invent
 a height, a tx range, or a spend from a partially written block: it re-reads
 the window, rebuilds a derived index from Class A, or cuts the tail.
 
-**The residual in-place state.** `confirmed.body`, `header_txs_*`,
-`header.head`, `txstat.body`, and the scripthash ingest head journal a synced
-`*.ahead` image, and open restores it. A strong bit a fence run names is set
-again by `restore_strong_from_fence`. `strong_tx` has no sidecar. The
-scripthash index is gated instead
-of repaired: an append, an unlink or a deferred empty-head commit writes
-`scripthash.dirty` before it writes. A full synced `ScriptHashTable::flush`
-(file data, then the `scripthash.body`, `scripthash.head` and
-`scripthash.ovf` directories) removes the mark only when no write started
-since its sync began, and never a mark that was present at open or that a
-failed write left: syncing torn bytes does not repair them, so only a wipe
-removes those. A clean shutdown of a dirty index runs that flush. The cold
-build and pack paths do not mark: an unsealed shard is untrusted until its
-pack mark, and its keys stay in ingest or overflow until then. A start with
-`--sh-index` that finds the file refuses and names the fix:
+## Two doors
+
+**The sector rule.** The store assumes the device writes a 512-byte sector
+whole or not at all, and that nothing below the filesystem re-encodes data in
+larger units (for example dm-crypt with a 4 KiB sector on a 512-byte disk, or
+a RAID 5/6 stripe without a write journal). The kernel writes a whole page
+back, but a sector whose bytes did not change lands unchanged. A crash can
+therefore leave any subset of the changed sectors new. A write needs no mark
+when every such subset is a state open accepts. Two shapes always pass:
+
+- An append: every byte is at or past the committed end, including bytes that
+  share the committed tail block. It is synced before the length that names
+  it is published, so a torn append is bytes open does not read.
+- A write inside one sector, such as the 8-byte length at offset 8 or a
+  `txstat` cell. It lands old or new. On a file whose commit a mark is
+  protecting, it still has to be inside that mark's pages: it may belong to
+  that commit, and open would roll the mark back around it.
+
+**The small-write rule.** The sector rule covers a crash. A running process
+has a second assumption: a write of a few bytes inside one sector is never
+left half applied. `handle_pwrite_all` retries a short `pwrite` for the
+bytes it did not write, so a cell can only stay half new if the kernel takes
+part of it and the retry then fails, or the process stops between the two
+writes. A crash there keeps the half-new cell on the device, so open relies
+on this rule as well as the sector rule. The 8-byte length at offset 8 and
+the `txstat` cells rely on it, and a half-new `txstat` cell still decodes.
+Linux shortens a write at a file-size limit (`RLIMIT_FSIZE`) before it
+copies, interior overwrites included, so the one software way to split an
+aligned 8- or 16-byte field is a limit set to a byte offset inside it. A
+limit in whole KiB, as `ulimit -f` and systemd `LimitFSIZE=` set it, cannot
+split such a field, and the node sets none. A copy-on-write filesystem out
+of space has not been shown to split one. A drive that tears inside a
+sector can, and is outside the device contract below.
+
+This is the assumption storage engines with a single-sector commit record
+make and do not guard in software. PostgreSQL keeps `pg_control` within
+`PG_CONTROL_MAX_SAFE_SIZE` (512 bytes) so one `write()` updates it, and
+reports any short write as an error
+([`pg_control.h`](https://doxygen.postgresql.org/pg__control_8h_source.html),
+[ENOSPC](https://wiki.postgresql.org/wiki/ENOSPC)). LMDB writes its meta
+page in place and relies on 512-byte sector atomicity, placing the txnid last
+so a meta page cut short is ignored
+([openldap-devel](https://www.openldap.org/lists/openldap-devel/201410/msg00004.html)).
+SQLite assumes less: a sector write may be partial but is linear, and it
+journals whole sectors instead
+([psow](https://sqlite.org/psow.html),
+[atomic commit](https://www.sqlite.org/atomiccommit.html)).
+
+**The device the rules need.** Both rules describe an SSD that does two
+things: it keeps every write a completed flush acknowledged, and it writes
+each logical block whole or not at all when power fails. NVMe states the
+second per command. Identify Controller reports the power-fail atomic write
+unit as `AWUPF`, counted in logical blocks from zero, and a write of at most
+that many blocks lands whole; every controller covers at least one block,
+512 bytes or 4 KiB by namespace format
+([NVMe atomic writes](https://blogs.oracle.com/linux/nvme-atomic-write-with-qemu),
+[FAST '25](https://www.usenix.org/conference/fast25/presentation/jeon)).
+The kernel writes dirty pages back in commands of one page or more, so a
+command, including an append that shares its tail block with committed rows,
+can be larger than that unit. The specification promises nothing for such a
+command, and the sector rule then rests on the drive keeping each block it
+carries old or new. A 4 KiB format makes each block a whole page; for a
+command above `AWUPF` the sector rule still depends on the drive keeping
+each block old or new, so the format is not a substitute for that behavior.
+Prefer a 4 KiB format where the drive offers one. `nvme id-ctrl` shows `awupf`; `nvme id-ns` lists the formats, and
+`nvme format --lbaf` changes it and erases the namespace.
+
+The flush is where consumer drives differ. In a 2022 test that wrote,
+flushed, and then cut power, the Samsung 970 EVO Plus 2TB and the WD Red
+SN700 1TB kept every flushed write. The SK hynix Gold P31 2TB and the
+Sabrent Rocket 512GB lost flushed data
+([Tom's Hardware](https://www.tomshardware.com/news/sk-hynix-sabrent-rocket-ssds-data-loss),
+[GIGAZINE](https://gigazine.net/gsc_news/en/20220224-ssd-cache-risk-data-loss/)).
+A drive that loses flushed data breaks every rule in this file, not only
+the sector rule, as it would for any database. Older SATA consumer drives
+were also seen to tear a single block on power loss
+([Zheng et al., FAST '13](https://www.usenix.org/conference/fast13/understanding-robustness-ssds-under-power-fault)).
+Drives with power-loss protection, which most enterprise and data-center
+models have, meet both requirements by design.
+
+The spend delta asks less of the device than these rules do. It never
+writes a 4 KiB block that holds bytes its commit names, so a block torn to
+zeroes loses nothing ([107](./external_findings/107-torn-spend-page.md)).
+That margin stays for the delta's I/O shape. The rest of the store does not
+rely on it. On a device that can tear a block it did not finish writing, a
+torn tail block can change committed rows an append shares it with, not
+only cut them. Open catches that for `txid.body` rows in the blocks tip
+revalidation rechecks (it recomputes each merkle root) and for header rows
+near the tip (rehashed against the parent); elsewhere a changed row can be
+served. A torn page 0 is refused only when its magic, schema or kind bytes
+tore: a torn length that stays aligned and inside the file is trusted.
+
+Any other write that changes committed bytes in more than one sector goes
+through `page_guard`. The writer stores an image of every page that
+write will touch, syncs that mark, writes the live bytes, syncs them, then
+removes the mark. Open copies the images back while the mark is there, and
+accepts the live pages only after the mark is gone. Restore copies each
+image verbatim and does not check its kind, so the writer picks the
+outcome: a backward mark holds pre-images and a crash rolls the write back;
+a forward mark holds the finished pages and a crash completes the write.
+Each mark's doc names its kind. The committed end is the durable header
+length, not a RAM high-water.
+
+A live mark owns every byte on the pages it images, appends included.
+Restore writes whole pages, so an append that shares an imaged page rolls
+back or completes with the mark, and it is durable only once the mark is
+cleared. While the mark is live, the length that names such an append has
+to sit on a page the same mark images, so it rolls back or completes with
+the bytes. A leading header keeps that length at offset 8 on page 0, which
+the sector rule above already keeps inside the mark. No length in a file
+outside the mark, and no trailing footer past the committed end, may name
+it.
+
+**The marks.** `confirmed.body`, `header_txs_*`, and `strong_tx` use
+`store/guard/class_c`. `header.body` is an append: rows, then length, each
+synced before the head insert. Open indexes the rows the head does not name.
+The first append alone arms the empty `store/guard/header.body` flag.
+`header.head` uses `store/guard/header.head`. `header.head.mlt` is an append:
+rows, then length, each synced before the head mark arms. A new head
+generation, its `.mlt`, and their directory are synced at create, before any
+mark can arm over them: the first insert keeps the length, so its mark does
+not image page 0, and a restore recreates a lost name from the images alone.
+`spent.ovf` appends past its durable length and publishes the length only at
+a spend checkpoint or flush, after the nodes are synced. A scripthash commit, including an
+in-place slab and a head word, uses `store/guard/sh-*`. A `txstat` stamp
+needs no mark: each cell and block slot sits inside one sector, and the stamp
+is synced. Block-filter and silent-payment tweak puts are appends: bytes,
+then lengths, body before idx, each synced, with no mark. A new segment
+pair's names are synced before any length; Windows cannot sync a directory,
+so there NTFS metadata journaling carries them. Open drops a newest pair
+missing one file, and the index re-derives those heights. The mempool flush
+appends its body the same way, then uses `mempool/guard/flush` for slots and
+`meta`.
+`tx.head` `*.mlt` is renamed into place, and the segment meta bit says the
+file must exist. A strong bit a fence run names is set again by
+`restore_strong_from_fence`.
+
+The scripthash index is still gated: an append, an unlink, or a deferred
+empty-head commit writes `scripthash.dirty` before it writes. A full synced
+`ScriptHashTable::flush` (file data, then the `scripthash.body`,
+`scripthash.head`, and `scripthash.ovf` directories) removes the mark only
+when no write started since its sync began, and never a mark that was present
+at open or that a failed write left. A clean shutdown of a dirty index runs
+that flush. The cold build and pack paths do not mark: an unsealed shard is
+untrusted until its pack mark, and its keys stay in ingest or overflow until
+then. The seal syncs the shard body (data, length, and alloc header) before it
+writes the mark, so a marked shard never names chains the device lacks. A start with `--sh-index` that finds the file refuses and names the fix:
 `RBITCOIN_SH_FORCE_REBUILD=1` (or the `scripthash.rebuild` and degraded
 markers) wipes the index at open and removes the file, or start without
-`--sh-index`. A same-class scripthash slab rewritten in place can still tear
-([#2074](https://github.com/rbitcoin-org/rbitcoin/issues/2074)). An undo
-restore of one head word can tear the neighbor slots on that page
-([#2132](https://github.com/rbitcoin-org/rbitcoin/issues/2132)). Until
-those are closed, the whole-store guarantee is the guarded state above, not
-every row. There is also no clean-close gate and no whole-store snapshot, so a
+`--sh-index`. There is no clean-close gate and no whole-store snapshot, so a
 Class B/C decode error after a crash can be crash damage rather than a
 hardware fault: the scripthash path marks the index degraded and rebuilds,
 while a Class A read error stops open. A design that needs one auditable
 "closed cleanly" predicate, or a whole-store restore, needs a snapshot instead.
+
+**The write probe.** CI runs the test suite with the `write-probe` feature
+on `rbitcoin-store`. Every TableFile write below a file's durable end
+(the bulk body path included), and every length publish the length and
+footer writers name as one, is logged by class: a fresh file, pages a mark
+images, one sector (or a length that shares sector 0 with every byte it
+names), or a length published before or after its bytes were synced. A
+payload range counts as unsynced until a sync that began after it landed
+returns. A length that does not grow rewrites durable bytes, so it is
+classed like an in-place write: a mark's pages, one sector, or several. A
+length that names bytes on pages the file's live mark images, when that
+mark does not image the length too, is `LEN_ON_MARK`: a restore rewrites
+those pages from the mark's images and keeps the length, so whether the
+named bytes survive depends on what the mark holds. It is never safe by
+structure. A length whose own write (a trailing footer) spans two sectors
+with no mark over it is `LEN_MULTI_SECTOR`, even when the bytes it names
+are synced: the footer itself can land torn. A trailing table
+opened from disk starts from its footer as its durable end. Every length
+end a crash can leave counts: the last one a sync covered, each one written
+since, and a leading header's end on file. A payload below the longest
+overwrites bytes some outcome names, so neither an unsynced shrink nor a
+later unsynced length hides an earlier one; a write that failed adds no
+end. A length is judged from the longest end too. Only the header of a file
+this process created and never synced is `CREATE`; a sync the debug build
+skipped records nothing.
+Files outside any store are logged as fixtures; a split store's cold
+index directories (`blockfilter.*`, `sp_tweaks.*`) and the Class A stems
+keep their class. `scripts/write-probe-classify.py` passes the classes that
+are safe by structure and fails CI on any other entry without a reviewed reason in
+its rule list: a Class A length past the synced floor, the `spent.body`
+fold that open replays, a hash-checked filter repair, and the few writes a
+dirty flag or a fresh file covers. A new writer that needs a new rule gets
+one in the same change, with its reason. A log the probe cannot append to
+fails the test that wrote it.
 
 ## Tip as commit point
 
@@ -116,7 +302,7 @@ Best-chain views ignore uncommitted Class C state:
 
 On open (in order):
 
-0. Store open restores `confirmed.body.ahead`, then cuts the tip below a null `confirmed[]` slot in the block that holds the sealed tip, or refuses a null slot anywhere else below it (What open trusts, above).
+0. Store open restores `store/guard/class_c`, then cuts the tip below a null `confirmed[]` slot in the block that holds the sealed tip, or refuses a null slot anywhere else below it (What open trusts, above). The header table open that follows restores `store/guard/header.head` before it reads the head. A `store/guard/header.body` flag lets an empty head sit beside body rows. Open indexes the rows the head does not name, and removes the flag only after `header.head` durably names them, so an open that stops in between reads it again.
 1. Soft `store/tip_seal` (if present): clamp confirmed tip that advanced without a complete barrier seal. This runs before the trailing-null trim, so a null run the clamp leaves on top is trimmed too.
 2. **Tip-window revalidate** (Core `-checkblocks`, default 6, `0` = all): first drop any trailing null `confirmed[]` slots (HWM ahead of last real tip), then the last N confirmed heights — `prev_fk`/hash chain, `header_txs` range bounds, merkle root from `txid.body`, and parent edges on `input`. The walk does not reject a height for a missing strong bit: open sets every strong bit a fence run names before the walk, and again after a shrink. The walk logs `store: tip revalidate <lo>..=<tip>` before the first height and a progress line every 10 seconds. For each create in a checked block, `input` must be stamped, the edge count must match the `seqsigwit` input count (skipped under `--prune-seqsigwit`), the first tx must be the only coinbase edge, and every other edge must name an existing create with an in-range vout. A missing `spend_durable` file is the whole chain (`n == 0`): nothing has been device-flushed, and a matching last 6 heights is not a proof. A present marker widens any other window to at least 6 and far enough to cover `(D, tip]`. `checkblocks=0` stays the whole chain. On failure: clear bad Class A association and/or shrink tip to last good height, rebuild the fence, flush confirmed. A read that fails is not a bad block. An OS error or a completion-session fault (anything but a corrupt or missing record, or a stored length past the body read cap) stops open with that error and changes nothing, as Core stops on a block it cannot read. The next start walks the same window. A short new-layout `input` high-water mark is Class A count skew: open truncates the other stems to the stamped input count before this window, so a `header_txs` range past that count shrinks the tip. Open does not stamp `n_in = 0` onto `PREV_ON_INPUTS` creates. A legacy store with no `input` file, or a partial legacy tail whose next record still has an inline prevout, still backfills edges from `seqsigwit`.
 3. After that walk, the same clear and restore run again, so a shrink does not leave strong bits off the final fence. `repair_class_c_above_tip` clears bits **not on the fence** via complement ranges (holes + suffix until a zero page) and does **not** walk every set bit. `restore_strong_from_fence` sets a bit a surviving run names. The clear logs `class_c repair cleared= ranges= ms=` even when zero.
@@ -130,9 +316,11 @@ Open revalidation runs in `Query::open_or_create` **before** P2P can extend tip.
 
 ### L2 write-behind + body queue (phase 6)
 
-- Compact Class C (`confirmed`, `header_txs_*`, `strong_tx`) mutate **RAM only** during the commit batch. The height fence is RAM-only (derived from those tables).
-- **Connect** barrier order on disk (**tip last**): `strong_tx` → `header_txs` → **`confirmed[]` last**.
-  - Mid-barrier kill after pre-tip tables: tip stays old; leftover strong not on the fence is repaired by `repair_class_c_above_tip`.
+- Compact Class C (`confirmed`, `header_txs_*`, `strong_tx`) mutate **RAM only** during the commit batch while a table's body is under the 256 MiB RAM cap. The height fence is RAM-only (derived from those tables).
+- A `confirmed` or `header_txs_*` table past that cap is fd-only (`strong_tx` is always in RAM). Its setters write the file during the commit batch, before the connect barrier: each `confirmed[]` `set_many` and each `header_txs` pair put arms its own `guard/class_c` mark, writes, syncs the file, and clears the mark before it returns. A pair put that names new creates goes through `Store::put_header_ranges`, which runs the Class A sync first when the pair is fd-only, so a durable range never names a create the device does not hold.
+- **Connect** barrier (`flush_class_c_tip`) writes `strong_tx`, and each RAM-tier `header_txs` column and `confirmed[]`, under one forward `guard/class_c` mark.
+  - A kill before the mark is armed leaves those RAM-tier tables old. After it is armed, open restores the imaged pages, so the tip and the other tables move together. A leftover strong bit not on the fence is repaired by `repair_class_c_above_tip`.
+  - An fd-only table's values its setter already wrote stay new. A `confirmed[]` entry above `tip_seal` is cut when open clamps the tip to the seal; a strong bit it lacks is set by `restore_strong_from_fence`, and tip revalidation shrinks the tip to the last complete block. A durable fd `header_txs` range above the tip is a Class A body above the tip.
   - Never flush `confirmed` before strong on connect — tip with permanent unstrong txs (repair only clears leftover strong).
 - **Disconnect** barrier order (**tip first** — opposite of connect):
   1. SH unlink only (do not unstrong yet).
@@ -147,7 +335,7 @@ Open revalidation runs in `Query::open_or_create` **before** P2P can extend tip.
 
 - Append-oriented; re-archive is **idempotent** when `header_txs` already present.
 - **Never leads tip** on a clean run: Class A is published only on the confirm-write path with tip advance in the same era (no dual-track archive-ahead). A crash between the Class A write and the tip advance can leave bodies above the tip. IBD gets them again through the tip-hole cover.
-- Kill mid-archive without a complete body association ⇒ not treated as archived; re-getdata. The locator header length is the create count. Body headers are written in that same commit, and the locator header is last, so a crash can leave a body header ahead of the count. Open truncates that body to the count's stem ends. A body header short of the locator count is the same unpublished tail: the connect barrier syncs Class A before Class C, so no committed row names it. Open keeps the largest create count every body header still covers, and a short `input.body` header cuts `input.loc` to the inputs it covers. The short-input probe runs only inside that covered prefix. An `input` stem whose count passed that prefix is cut to it. Open keeps exactly the creates a durable record names and cuts the rest without reading it. The floor is the highest create a `header_txs` range names, or `class_a.synced`, whichever is higher. Every record that names creates without a `header_txs` range (a spend delta commit, the scripthash `DONE.keys` / `DONE.post` marks, `include_hwm`) goes through `TxTable::sync_class_a_named` first. That call syncs Class A, then publishes `class_a.synced` by synced rename. Each Class A barrier writes the partial last block and every stem's published length into the inactive `tear_guard/tail.0` or `tail.1` file and syncs that file with the stems, before `class_a.synced`. `tear_guard/first` keeps one copy of each stem's first 4 KiB, sealed once the page is full and not rewritten after that, including when a txstat stamp lands in that page. Open writes a zeroed first page back from `first` and then sets the length from the newest checksum-valid tail header when that length is newer. A zeroed partial tail is restored only from the matching tail slot. A range that still holds bytes is left as it is. A zeroed prefix with no usable image stops open. A still-zero `input.body`, `txstat.*`, `seqsigwit.body`, or `spent.body` tail is the data when no tail slot exists yet, because a coinbase edge, an unstamped txstat cell, an empty seqsigwit pad, and an unspent slot are zero bytes. A zeroed txid tail with no image still stops open. A leftover `CATK` `.kept` from an earlier build of this recovery is applied once when its range is zeroes and then removed. A failed write in an append (a body, locator, `txid.body`, `txstat`, or `input` row or header) fails that append and sets the latch a failed Class A sync sets: no later append, barrier, or mark runs, and the node stops. A mark therefore never names a create whose header missed, and open fits the archive on restart. Each record names `TxTable::settled_count`, not `count`: an append publishes its bodies and locator before `txid.body`, `txstat`, and `input`, and a spend checkpoint or scripthash pass running beside it must not name that unfinished tail. So every create through the floor is on the device, and nothing durable names one past it. A header can land without its rows, and a zeroed row can still decode (an all-zero input edge is a coinbase edge), so open does not read the tail to decide what to keep. The locators are cut to the floor before any other range read. A fit below the floor can only come from a binary without this barrier, or a device that lost synced writes. Freeing those numbers would hand them to later transactions under stale spends and scripthash postings, so open refuses and asks for a reindex. The `create.loc` and `seqsigwit.loc` opens refuse before their first cut, and the count repair refuses before it cuts a body, `txid.body`, or `txstat`. Two fits can land before the refusal: the locators cut to the floor, which drops only rows past it, and `input.loc` cut to its own body header. A store with Class C rows and no archive (a fixture) has nothing to refuse over. A `create.loc` count ahead of `seqsigwit.loc`, a short `create.off` / `seqsigwit.off`, a checkpoint longer than its locator, or an overflow row sitting past the overflow header is that unpublished tail and truncates to the last create those files still name. A failed read of the locator slot for a row past the overflow header stops open. `--prune-seqsigwit` stays on the last sealed tip, in tip mode and on the next IBD batch. Disconnecting a block that was never sealed does not move that tip. A short input or locator below a committed create is that same image and refuses. Trailing null `confirmed` slots are not that drop. A Class C image with a tx range and no archive is left in place.
+- Kill mid-archive without a complete body association ⇒ not treated as archived; re-getdata. The locator header length is the create count. Body headers are written in that same commit, and the locator header is last, so a crash can leave a body header ahead of the count. Open truncates that body to the count's stem ends. A body header short of the locator count is the same unpublished tail: the connect barrier syncs Class A before Class C, so no committed row names it. Open keeps the largest create count every body header still covers, and a short `input.body` header cuts `input.loc` to the inputs it covers. The short-input probe runs only inside that covered prefix. An `input` stem whose count passed that prefix is cut to it. Open keeps exactly the creates a durable record names and cuts the rest without reading it. The floor is the highest create a `header_txs` range names, or `class_a.synced`, whichever is higher. Every record that names creates without a `header_txs` range (a spend delta commit, the scripthash `DONE.keys` / `DONE.post` marks, `include_hwm`) goes through `TxTable::sync_class_a_named` first. That call syncs Class A, then publishes `class_a.synced` by synced rename. Each Class A barrier syncs the stems before `class_a.synced`. An append writes past the committed end; under the sector rule the sectors it shares with committed rows land unchanged, so no page image is kept. A still-zero `input.body`, `txstat.*`, `seqsigwit.body`, or `spent.body` tail is data: a coinbase edge, an unstamped txstat cell, an empty seqsigwit pad, and an unspent slot are zero bytes. A failed write in an append (a body, locator, `txid.body`, `txstat`, or `input` row or header) fails that append and sets the latch a failed Class A sync sets: no later append, barrier, or mark runs, and the node stops. A mark therefore never names a create whose header missed, and open fits the archive on restart. Each record names `TxTable::settled_count`, not `count`: an append publishes its bodies and locator before `txid.body`, `txstat`, and `input`, and a spend checkpoint or scripthash pass running beside it must not name that unfinished tail. So every create through the floor is on the device, and nothing durable names one past it. A header can land without its rows, and a zeroed row can still decode (an all-zero input edge is a coinbase edge), so open does not read the tail to decide what to keep. The locators are cut to the floor before any other range read. A fit below the floor can only come from a binary without this barrier, or a device that lost synced writes. Freeing those numbers would hand them to later transactions under stale spends and scripthash postings, so open refuses and asks for a reindex. The `create.loc` and `seqsigwit.loc` opens refuse before their first cut, and the count repair refuses before it cuts a body, `txid.body`, or `txstat`. Two fits can land before the refusal: the locators cut to the floor, which drops only rows past it, and `input.loc` cut to its own body header. A store with Class C rows and no archive (a fixture) has nothing to refuse over. A `create.loc` count ahead of `seqsigwit.loc`, a short `create.off` / `seqsigwit.off`, a checkpoint longer than its locator, or an overflow row sitting past the overflow header is that unpublished tail and truncates to the last create those files still name. A failed read of the locator slot for a row past the overflow header stops open. `--prune-seqsigwit` stays on the last sealed tip, in tip mode and on the next IBD batch. Disconnecting a block that was never sealed does not move that tip. A short input or locator below a committed create is that same image and refuses. Trailing null `confirmed` slots are not that drop. A Class C image with a tx range and no archive is left in place.
 
 ## Spends (v5: annotation on create outputs)
 
@@ -175,12 +363,29 @@ Open revalidation runs in `Query::open_or_create` **before** P2P can extend tip.
   append skips each `fk ≤` the last fk its head or last page already holds.
   Hot path only appends + maintains heads in RAM.
 - Creates for unstrong / above-tip txs are **invisible** via `is_confirmed_strong`.
+- Append: one batch packs every key before it writes a slab, then arms its
+  `guard/sh-*` mark with page 0 (the alloc header) and every body range it
+  writes. A batch that reuses a free offset syncs an alloc header that no
+  longer names it before it writes that slab, so no durable header names a
+  written slab as free. A crash while the mark is armed does not leak the
+  offset: open restores the header, which names it as the free head again,
+  and the slab bytes with its free-list link. Otherwise the payloads are
+  synced before the header. The heads move
+  last. A slab a class change replaced joins the free list only after the
+  head that stopped naming it is durable: a main shard or sealed overflow
+  head, updated in place, is synced first; an ingest head was already
+  synced by its insert, or by the seal that moved it to a sealed file. The
+  link is synced before the header names it. Only a body that reused an
+  offset takes the extra barrier.
 - Disconnect tip: **one unlink per scripthash**. A megakey drops that block's
-  creates from the tail pages. The saved page image is synced before the undo
-  record is published. The page the head names is updated before any earlier
-  page is rewritten, then the head moves. Old pages are freed only after that.
-  If clearing the undo fails, the saved page and the old head word are written
-  back. A crash does the same restore, so the same disconnect can run again.
+  creates from the tail pages. Its `guard/sh-*` mark of the tail pages and
+  the head word is synced first. The page the head names is updated before
+  any earlier page is rewritten, then the head moves. Old pages are freed
+  only after that. A failed clear leaves the mark armed and marks the index
+  degraded, and the disconnect goes on to make the tip shrink durable. Open
+  restores the mark, which rolls back the index pages only. The durable tip
+  decides whether the chain disconnect runs again: only a crash before the
+  tip shrink is durable leaves that block as the tip.
   A non-suffix unlink writes the replacement, syncs those bytes and the new
   heads once for the whole disconnect, then frees the old pages.
   A full-list unlink does not sync the empty head until the tip shrink is durable.
@@ -202,21 +407,25 @@ Open revalidation runs in `Query::open_or_create` **before** P2P can extend tip.
   `scripthash.runs` and `scripthash.unsorted` together. The wipe also clears an unlink undo record left armed by
   a failed unlink, so the next open does not reject it.
   The marker rescues faults that surface after open succeeded: a torn page, a failed write or unlink, a read of a
-  torn key. It cannot rescue damage that makes open itself fail (a truncated `scripthash.head/NN.val`, a torn
-  undo record, or an alloc header whose bump or free head is out of range): open validates the SH files before it reads the marker, so such a store does not start, with or
-  without `RBITCOIN_SH_AUTO_REBUILD` and `RBITCOIN_SH_FORCE_REBUILD`, and the fix is to stop the node, remove
+  torn key. Open restores the `guard/sh-*` marks before it opens the index. A published mark that does not
+  parse writes `scripthash.rebuild` and drops the scripthash marks, and the index open then discards the SH
+  files before it decodes them, so that start rebuilds from Class A. An OS error while restoring a mark still
+  stops open. Without such a request, damage that makes the index open fail (a truncated
+  `scripthash.head/NN.val`, a torn undo record, or an alloc header whose bump or free head is out of range)
+  is decoded before the degraded marker is read, so such a store does not start, with or without
+  `RBITCOIN_SH_AUTO_REBUILD` and `RBITCOIN_SH_FORCE_REBUILD`, and the fix is to stop the node, remove
   `scripthash*` (the marker included) from the store directory and start again; tip entry then builds the index
   cold from Class A.
 
 ## Flush
 
-Clean shutdown: `flush_for_shutdown` runs the connect barrier (Class A `sync_data`, then Class C, incl. L2 dirty images), then async Class A, then one `tx.head` snapshot. A snapshot error is logged and does not skip those writebacks.
+Clean shutdown: the node first stops the writers (listeners, write-behind, tip accepts, the last spend checkpoint). An error there is kept as the exit error and the tail goes on. `flush_for_shutdown` then runs its steps costliest-first, and a failed step does not skip the ones after it: a synced flush of a dirty scripthash index (clears `scripthash.dirty`, except a mark present at open or one a failed write left, which stays until a rebuild), headers, the connect barrier (Class A `sync_data`, then Class C, incl. L2 dirty images), async Class A, then one `tx.head` snapshot. The barrier is skipped after a failed header sync, a failed IBD tip flush, or a missing keep-window file, so the next start resumes from the last seal. Each failure is logged, and the first is returned; the node then exits non-zero. A snapshot error is only logged. The mempool flush and the `peers` save come after the store. A disconnect unlinks the block's scripthash postings before its tip shrink is durable; if the shrink fails, the mark is held until a rebuild, because a sync would make an index that no longer matches the disk tip look whole.
 Steady path: payload pwrite + HWM publish; `sync_data` on flush barriers.
 Kill mid-payload before HWM publish: readers never see past previous published length.
 
-Connect barrier (`flush_class_c_tip`): Class A `sync_data` → headers (if dirty) → strong → header_txs → **confirmed last** → soft `tip_seal` (tmp + `sync_all` + rename + parent-directory `fsync`). The height fence is RAM-only and is not flushed. The Class A step is `TxTable::sync_class_a_data`: `txout`, `seqsigwit`, `spent`, both locator families (loc, overflow, checkpoint), `txid.body`, `txstat`, and `input`. Not `tx.head`. The sixteen syncs go to the configured bulk-IO session together (`bulk_io::sync_data_batch`): datasync `IORING_OP_FSYNC` ops in one io_uring submission, the shared `rbtc-io-pool` workers, or IOCP, which has no overlapped flush and flushes inline. In flight together, the filesystem can share journal commits and device flushes between them. With `RBITCOIN_IO=pread`, or for a file the session never submitted, they run one after another. Once a sync is submitted it may have taken the file description's writeback error, and a retry on that fd returns 0, so a failed batch reports every submitted sync it did not hear back from as EIO. The spend checkpoint runs the same Class A sync after it freezes the open notes and before it renames `spent.delta/commit`, so a commit never names a spender whose archive is unsynced (in IBD the spender can be strong on the RAM tip while its barrier is in flight). Class A syncs, and the spend fold's `spent.body` sync on the same fd, run one at a time under the latch's lock, so a sync that returns 0 because a concurrent one took the writeback error cannot commit after that failure. A failed sync fails the barrier before any Class C table is written, and latches: every later Class A sync (the barrier, the spend checkpoint, a scripthash collect, the table flush at shutdown, and the `input` flush of the backfill and the prune release) refuses until restart, because a retried fsync can succeed after the kernel dropped the dirty pages. The first failure also stops the node (the hook `node_shutdown` registers): it exits non-zero instead of failing every later block, and the shutdown flush writes no Class C row. So no `confirmed[]`, strong bit, or `header_txs` range on disk names a create the device does not hold, and a Class A tail open finds past those rows is unpublished. `flush_header_archive` runs the same Class A step before its `header_txs` flush, and so does the mutated-body clear (`clear_archived_body_here`), whose flush writes every dirty range.
+Connect barrier (`flush_class_c_tip`): Class A `sync_data` → headers (if dirty) → one forward `guard/class_c` mark over `strong_tx` and each RAM-tier `header_txs` column and `confirmed[]` → soft `tip_seal` (tmp + `sync_all` + rename + parent-directory `fsync`). The height fence is RAM-only and is not flushed. An fd-only `confirmed` or `header_txs_*` table wrote its values before this barrier ([L2 write-behind](#l2-write-behind--body-queue-phase-6)); an fd `header_txs` put ran the Class A sync before its pair. The Class A step is `TxTable::sync_class_a_data`: `txout`, `seqsigwit`, `spent`, both locator families (loc, overflow, checkpoint), `txid.body`, `txstat`, and `input`. Not `tx.head`. The sixteen syncs go to the configured bulk-IO session together (`bulk_io::sync_data_batch`): datasync `IORING_OP_FSYNC` ops in one io_uring submission, the shared `rbtc-io-pool` workers, or IOCP, which has no overlapped flush and flushes inline. In flight together, the filesystem can share journal commits and device flushes between them. With `RBITCOIN_IO=pread`, or for a file the session never submitted, they run one after another. Once a sync is submitted it may have taken the file description's writeback error, and a retry on that fd returns 0, so a failed batch reports every submitted sync it did not hear back from as EIO. The spend checkpoint runs the same Class A sync after it freezes the open notes and before it renames `spent.delta/commit`, so a commit never names a spender whose archive is unsynced (in IBD the spender can be strong on the RAM tip while its barrier is in flight). Class A syncs, and the spend fold's `spent.body` sync on the same fd, run one at a time under the latch's lock, so a sync that returns 0 because a concurrent one took the writeback error cannot commit after that failure. A failed sync fails the barrier before it writes any RAM-tier Class C table, and latches: every later Class A sync (the barrier, the spend checkpoint, a scripthash collect, the table flush at shutdown, the `input` flush of the backfill and the prune release, and a `txstat` stats stamp, whose own failed write or sync latches too) refuses until restart, because a retried fsync can succeed after the kernel dropped the dirty pages. The first failure also stops the node (the hook `node_shutdown` registers): it exits non-zero instead of failing every later block, and the shutdown flush writes no Class C row. An fd-only `confirmed[]` row the connect stored before the barrier is already on disk when that sync fails. It names a header, not a create: the creates come through that header's `header_txs` range, which is either RAM-tier and not written, or fd-only and written only after its put's own Class A sync. Connect appends it above the sealed tip, and only a complete barrier or a disconnect's confirmed flush moves the seal, so open's `tip_seal` clamp ([On open](#tip-as-commit-point), step 1) drops it. A store with no `tip_seal` file keeps the row, which is still safe by the range rule above. So no `confirmed[]`, strong bit, or `header_txs` range on disk names a create the device does not hold, and a Class A tail open finds past those rows is unpublished. `flush_header_archive` runs the same Class A step before its `header_txs` flush, and so does the mutated-body clear (`clear_archived_body_here`), whose flush writes every dirty range.
 
-IBD runs that barrier on one long-lived `rbtc-tip-flush` thread for the confirm engine, so the next write batch's checks overlap it. The tip flush reads tails already covered by `published_len` and does not lock the append. It writes the inactive tear-guard slot and fsyncs that slot in the same Class A data sync. A page-0 image stores that loaded length, and open writes the slot length into that page in one write. Header range puts and the other Class C stores wait until that flush is joined. A structural reject after the body append still stores those header ranges after the join, so a retry sees `header_txs` and does not append the body again. Class C still flushes once per batch. Every `tip_commit` taker joins it first: the next commit, a disconnect or rewind, `Query::flush`, `flush_for_shutdown`, and dropping the `Query`. The order on disk does not change. A kill can lose one more write batch than in Tip mode. Its body-queue rows are already gone (RAM only, fetched again), and its spend annotations and filter or tweak puts may sit above the durable tip: open replays annotations and trims both indexes to the tip. A failed IBD barrier is not retried, because a failed `fsync` may have dropped the dirty pages. Every later commit fails until restart, so IBD halts after its one engine-fault retry. Tip mode runs the barrier inline.
+IBD runs that barrier on one long-lived `rbtc-tip-flush` thread for the confirm engine, so the next write batch's checks overlap it. The tip flush reads tails already covered by `published_len` and does not lock the append. Its Class A step is the same `TxTable::sync_class_a_data` stem sync as Tip mode. It writes no tear-guard slot and keeps no page image: an append writes past the committed end, and under the sector rule the sectors it shares with committed rows land unchanged ([Store integrity](#store-integrity-what-a-crash-can-and-cannot-do)). Header range puts and the other Class C stores wait until that flush is joined. A structural reject after the body append still stores those header ranges after the join, so a retry sees `header_txs` and does not append the body again. Class C still flushes once per batch. Every `tip_commit` taker joins it first: the next commit, a disconnect or rewind, `Query::flush`, `flush_for_shutdown`, and dropping the `Query`. The order on disk does not change. A kill can lose one more write batch than in Tip mode. Its body-queue rows are already gone (RAM only, fetched again), and its spend annotations and filter or tweak puts may sit above the durable tip: open replays annotations and trims both indexes to the tip. A failed IBD barrier is not retried, because a failed `fsync` may have dropped the dirty pages. Every later commit fails until restart, so IBD halts after its one engine-fault retry. Tip mode runs the barrier inline.
 Disconnect: confirmed truncate + `flush_confirmed_only` (also refreshes `tip_seal`) before unstrong/height clear. If the new tip is below `spend_durable`, that marker is lowered to the tip.
 
 Confirm stores a snapshot height after annotations are written and does not `sync_data` these stems. Historical slots are delta records. The checkpoint writes them into `spent.delta` before the stem sync. `rbtc-spend-sync` does, about every 10 minutes: the spend checkpoint, whose freeze step runs `sync_data` on `spenders` and on Class A (not a high-water rewrite, not `tx.head`) before its commit is renamed, then if the confirmed tip is still at least that snapshot, publish `A = D` at the snapshot. A cookie inside a data file, or a clean page cache, is not this cursor: writeback is not a device flush, and the kernel may reorder data ahead of a later header write. Blocks appended above the snapshot during the barrier are flushed along and are not claimed. A disconnect bumps an in-process generation before it lowers the snapshot and the marker, including when no marker file exists yet. The checkpoint samples that generation before `sync_data` and again under the marker lock; it publishes only when the generation is unchanged, the tip is still at least the snapshot, and no annotate is pending. A disconnect and a reconnect of a different block at the snapshot height during that window leave the previous marker in place. An append strictly above the snapshot does not bump the generation, so the marker still publishes. One still pending caps `A` below its first height. A failed marker publish leaves the previous marker and does not start a new interval. Shutdown wakes the thread for one checkpoint, joins it, then runs `flush_for_shutdown`. The barrier is `File::sync_data` (Linux `fdatasync`, macOS `F_FULLFSYNC`, Windows `FlushFileBuffers`). It is not inside `flush_class_c_tip`, and it is not charged on the confirm thread's `ann_sync` timer. Open replay runs that same `sync_data` on the replay stems and `spenders` before it publishes the marker, including when the rewrite left those files clean.
@@ -226,10 +435,10 @@ Confirm stores a snapshot height after annotations are written and does not `syn
 | Class C barrier (`strong`, `header_txs`, `confirmed`, `tip_seal`) | No. This is the commit point. | Every barrier |
 | Spend annotations (`spent.body`, `spent.delta/`, `spenders`) | Yes, from the block body and parent outputs, when those bytes are durable. Replay is only `(A, tip]`. Annotate never writes `spent.body`, and reads it only on a page a fold wrote. The checkpoint writes delta records, folds old segments into `spent.body`, and syncs the segments, `spent.body`, and the directory log or new base before `commit` and `A` advance. A schema-29 `spent.body` and `spend.pages` log become the delta's first generation on open, and `meta` moves to 30 only after that publish. A schema-30 store whose `spent.delta/` is gone refuses to open. [046](./external_findings/046-spend-durability.md) fixed the kill-9 gap where the marker advanced without the data sync ([107](./external_findings/107-torn-spend-page.md)) | `rbtc-spend-sync` about every 10 minutes, or early at 2,000,000 open edges, then advance `A` to the pre-sync snapshot |
 | Class A bodies the tip window reads (`txid.body` for the merkle root, `input` edges, `seqsigwit` input count unless pruned) plus the strong bits | Class A bodies in the window are not rebuilt from the tip. A strong bit a fence run names is set from that fence; a bit the fence does not name is cleared. Historical bodies outside `(D, tip]` are not revalidated. `store.secret` is an XOR of scripts and witness plus a keyed head mix ([`concurrency.md`](./concurrency.md), [`SCHEMA.md`](../SCHEMA.md)). It is not a MAC of record bodies. Bit-rot of those bodies is an accepted reindex ([106](./external_findings/106-historical-bitrot.md)) | Same `sync_data`, which advances durable-through `D` to that snapshot. Open revalidates `(D, tip]` (at least the last 6) when the marker is present, and from genesis when it is missing. The window does not read `txout` or `txstat` |
-| Scripthash heads, `tx.head` | Yes, from Class A | No barrier `fsync`. A corrupt record the write-behind apply reads (a torn slab after a power cut; recovery replays the jobs above `include_hwm`, which are the ones that tore) writes `scripthash.rebuild`. The apply is the single appender under `sh.appender`, so a reader racing an append never writes it. The next start treats the mark as `RBITCOIN_SH_FORCE_REBUILD` and removes it after the rebuild finishes; a crash before that rebuilds again. Write-behind runs only in Tip mode, after the inline barrier sealed the block; a failed Class A write latches and fails that barrier, so its postings name sealed creates. The bulk collect (`DONE.keys`, `DONE.post`) and the Class A tail backfill (`include_hwm`) `sync_data` Class A right after they sample the settled create count, so no marker names a create the device does not hold. An older binary did not, so its `include_hwm`, SEAL, or an unfinished collect's `DONE.keys`/`DONE.post` can name creates open then cut. Start, before any append can reuse a cut number, deletes the head and the unsorted collect when any of those marks is past the create count, and recollects from Class A. SH write-behind syncs the SH tables before it advances `scripthash.include_hwm` (a tip block, the end of a catch-up burst, or ≥1 s since the last advance); recovery replays the idempotent appends above that HWM. `sync=` on `tip: accept`. `tx.head` insert keeps the open tail in a private table and syncs `meta`, not those slots. A clean shutdown writes one dense snapshot of that tail (footer `generation` = the segment count) and fsyncs the image before it stores `generation`, then fsyncs that generation. A rebuild of an untrusted tail clears that segment's in-memory count and deletes the image before inserting, so a snapshot taken midway names only the rows stored. That write is about 1–2 s. A crash, or a snapshot whose `generation` is 0 or otherwise not that count, rebuilds the open tail from `txid.body` before probes are served. A full tail is about 10–20 s. An in-flight seal, which open already finishes from `txid.body`, adds about 15 s typical and up to about 30 s, so both together are about 25–50 s. The seal syncs its files before `meta` names it sealed. An IBD missing-parent verdict still scans `txid.body` from the oldest unsealed segment's first fk, read before the head read, and treats such a miss as `Corrupt` ([089](./external_findings/089-missing-parent-verdict.md)) |
-| `txstat` fee/size cells, overflow blobs, `txstat.blk` slots | Yes, from the block (`getblockstats`, and a block size, weight or summary read that had to rebuild an active block, stamp it) | The IBD archive writes them as Class A, so the barrier syncs them before Class C names the block. A later stamp writes the cells, then the blob, then the slot, unsynced until the next barrier. A stamped cell whose tail is missing, undecodable, behind a slot past the end of `txstat.ovf`, or on a create with no confirmed block reads as unstamped, so readers fall back and the next stamp writes it again. An IO error still fails the read |
+| Scripthash heads, `tx.head` | Yes, from Class A | No barrier `fsync`. A corrupt record the write-behind apply reads (a torn slab after a power cut; recovery replays the jobs above `include_hwm`, which are the ones that tore) writes `scripthash.rebuild`. The apply is the single appender under `sh.appender`, so a reader racing an append never writes it. The next start drops the scripthash files before store open decodes them (`discard_index_for_rebuild` in `open_scripthash`), so a torn file cannot stop that start, then treats the mark as `RBITCOIN_SH_FORCE_REBUILD` and removes it after the rebuild finishes; a crash before that rebuilds again. Write-behind runs only in Tip mode, after the inline barrier sealed the block; a failed Class A write latches and fails that barrier, so its postings name sealed creates. The bulk collect (`DONE.keys`, `DONE.post`) and the Class A tail backfill (`include_hwm`) `sync_data` Class A right after they sample the settled create count, so no marker names a create the device does not hold. An older binary did not, so its `include_hwm`, SEAL, or an unfinished collect's `DONE.keys`/`DONE.post` can name creates open then cut. Start, before any append can reuse a cut number, deletes the head and the unsorted collect when any of those marks is past the create count, and recollects from Class A. SH write-behind syncs the SH tables before it advances `scripthash.include_hwm` (a tip block, the end of a catch-up burst, or ≥1 s since the last advance); recovery replays the idempotent appends above that HWM. `sync=` on `tip: accept`. `tx.head` insert keeps the open tail in a private table and syncs `meta`, not those slots. A clean shutdown writes one dense snapshot of that tail (footer `generation` = the segment count) and fsyncs the image before it stores `generation`, then fsyncs that generation. A rebuild of an untrusted tail clears that segment's in-memory count and deletes the image before inserting, so a snapshot taken midway names only the rows stored. That write is about 1–2 s. A crash, or a snapshot whose `generation` is 0 or otherwise not that count, rebuilds the open tail from `txid.body` before probes are served. A full tail is about 10–20 s. An in-flight seal, which open already finishes from `txid.body`, adds about 15 s typical and up to about 30 s, so both together are about 25–50 s. The seal syncs its files before `meta` names it sealed. An IBD missing-parent verdict still scans `txid.body` from the oldest unsealed segment's first fk, read before the head read, and treats such a miss as `Corrupt` ([089](./external_findings/089-missing-parent-verdict.md)) |
+| `txstat` fee/size cells, overflow blobs, `txstat.blk` slots | Yes, from the block (`getblockstats`, and a block size, weight or summary read that had to rebuild an active block, stamp it) | The IBD archive writes them as Class A, so the barrier syncs them before Class C names the block. The archive syncs `txstat.ovf` once per batch before it writes any slot. A later stamp writes and syncs the cells, then writes a nonempty blob and syncs `txstat.ovf`, then writes and syncs the slot. A stamped cell whose tail is missing, undecodable, behind a slot past the end of `txstat.ovf`, or on a create with no confirmed block reads as unstamped, so readers fall back and the next stamp writes it again. An IO error still fails the read |
 | BIP-352 tweaks (`sp_tweaks.*`) | Yes, backfill from Class A | Each put syncs body, then idx. Open drops heights above the tip and fits the last record to its `n_tx` |
-| Mempool sidecar | No. RAM is source of truth. Open keeps an in-range prefix and moves an unreadable image aside | 5 s path and shutdown `flush`: `sync_data` body, then slots, then meta |
+| Mempool sidecar | No. RAM is source of truth. Open keeps an in-range prefix and moves an unreadable image aside | 5 s path and shutdown `flush`: one `guard/flush` mark (see **Order** under Mempool sidecar) |
 
 `tx.head` meta, the spend marker, store `meta`, and `store.secret` use the same parent-directory `fsync` as `tip_seal` after tmp+rename. The `store.secret` temp is created mode 0600 (a stale temp is removed first) and the secret is never replaced. Windows denies that directory handle; the file was already synced. A missing `spend_durable` revalidates and replays from genesis. `checkblocks=0` still walks from genesis when a marker is present.
 
@@ -238,10 +447,10 @@ Confirm stores a snapshot height after annotations are written and does not `syn
 Private, **not** Class A. RAM graph is source of truth; files may lag.
 
 - **New `meta`:** published by a synced temp file and rename, so a crash leaves no `meta` or a whole one. The unbroadcast list is replaced the same way.
-- **Order:** `persist_due` and shutdown `flush` write the packed `tx.body` tail, `sync_data` that file, then write LIVE slots and `sync_data` those, then `meta`. `persist_due` `pwrite`s only new LIVE slot records (not the full table). A crash after the body sync and before the new slots loses those admits. Open skips a LIVE row whose `body_off + body_len` sits past the logical body and keeps the in-range prefix. Compact stays tmp+rename of packed images (reclaim). An admit compacts before it appends when dead payloads reach the live payload bytes, so a full pool that reuses the slot each eviction frees does not grow `tx.body` until a block.
-- **5 s admits:** one `fdatasync` of the dirty body, then the slot sync, per dirty interval, from the tip-follow perf tick. Admits that missed that sync can still be lost (relay re-fetch). A lost admit can leave a durable child behind: a reorg re-admits a parent whose child was persisted while the parent was confirmed, and a crash before the next sync keeps the child alone. Tip-mode entry drops every reloaded tx with an input that is neither an unspent output on the active chain nor an output of a live pool tx, with its descendants (Core's reload rejects it as `missing-inputs`). A parent that only `tx.head` lost in the same power loss is still on the connected chain in `txid.body`: its child stays unless a block spent that output. `getblocktemplate`, `generate*` and the SV2 template provider select nothing from the pool until this purge has succeeded. Shutdown `flush` generation-bumps and uses the same sync order.
-- **Unreadable image:** bad magic, a schema this binary does not accept, or an in-range payload that does not decode or whose txid does not match the slot. Open moves `meta`, `slots`, `tx.body`, and their `.tmp` files under `mempool/torn-<unix>/` and starts empty. `fee_history` and `fee_history.log` stay. An IO error (the mempool path is not a directory, or the open returns IO rather than corrupt, magic, or schema) still fails startup. Class A is untouched.
-- **DEAD:** already-durable slots are a one-byte `pwrite` of the status. The owner of a removal (a block's confirmed txs and their conflict spends, an RBF, an expiry scan, a lone `remove_txid`) `fdatasync`s `slots` once, then writes `meta`. Open reloads from slot status and sets `live_count` from that scan, so a crash after the slots sync and before `meta` keeps the DEAD rows. A crash before the slots sync can resurrect those txs (same class as a lost admit: the body bytes are unchanged and still decode). An admit that never hit disk stays RAM-only (crash loses it). Do not dump the full slot table on strip — that would write LIVE rows whose body is still in the unpersisted tail. The many one-byte `pwrite`s dirty one 4K page per touched page; the following `fdatasync` writes those pages once.
+- **Order:** `persist_due` and shutdown `flush` append the new body records past the durable length, sync, write the body length in page 0 (one sector), and sync again. Only then do they publish one `guard/flush` mark of the slot pages and `meta`, write those pages, sync, and remove the mark. A crash before the slots leaves records past every LIVE slot, which open ignores. The mark holds the new page images, so a crash while it is armed finishes that flush on open. A flush that finds an earlier mark still armed applies it before it reads any live page. Open skips a LIVE row whose `body_off + body_len` sits past the logical body and keeps the in-range prefix. Compact stays tmp+rename of packed images (reclaim). It applies a leftover mark and syncs `guard/` before the renames, so a mark whose clear failed its directory sync cannot come back over the packed files. Every mark publishes `slot_cap` in `meta` only after the slot file at that cap is synced. An admit compacts before it appends when dead payloads reach the live payload bytes, so a full pool that reuses the slot each eviction frees does not grow `tx.body` until a block.
+- **5 s admits:** one **Order** commit per dirty interval, from the tip-follow perf tick. Admits that have not reached a published mark can still be lost (relay re-fetch). A lost admit can leave a durable child behind: a reorg re-admits a parent whose child was persisted while the parent was confirmed, and a crash before the next sync keeps the child alone. Tip-mode entry drops every reloaded tx with an input that is neither an unspent output on the active chain nor an output of a live pool tx, with its descendants (Core's reload rejects it as `missing-inputs`). A parent that only `tx.head` lost in the same power loss is still on the connected chain in `txid.body`: its child stays unless a block spent that output. `getblocktemplate`, `generate*` and the SV2 template provider select nothing from the pool until this purge has succeeded. Shutdown `flush` generation-bumps and uses the same commit.
+- **Unreadable image:** bad magic, a schema this binary does not accept, an in-range payload that does not decode or whose txid does not match the slot, or a `guard/flush` mark that does not parse. Open moves `meta`, `slots`, `tx.body`, their `.tmp` files, and `guard/flush` under `mempool/torn-<unix>/` and starts empty. `fee_history` and `fee_history.log` stay. An IO error (the mempool path is not a directory, or the open returns IO rather than corrupt, magic, or schema) still fails startup. Class A is untouched.
+- **DEAD:** already-durable slots are a `SLOT_DEAD` byte in the same `guard/flush` mark as the flush that publishes them. A removal (a block's confirmed txs and their conflict spends, an RBF, an expiry scan, a lone `remove_txid`) arms that mark immediately. Timed admits wait for the perf tick and use the same mark. Open reloads from slot status and sets `live_count` from that scan. A crash while the mark is armed reapplies those images on open, so a removal whose mark was published stays DEAD. A removal that had not published its mark yet can still resurrect those txs (same class as a lost admit: the body bytes are unchanged and still decode). An admit that never hit disk stays RAM-only (crash loses it). The mark does not dump LIVE rows whose body is still in the unpersisted tail. A queued death names the record it removed: a death sync applies any leftover mark first and stamps a slot only while its disk row still holds that record, so a replacement the mark installed stays LIVE.
 - **Leftover schema 1–3:** convert on open (recode LIVE payloads, tmp+rename like compact). Every upgraded record takes the wall-clock second of that open as its accept time. Schema 1 has empty vin aux (SH reindex batch-fills); schema ≤ 2 has unknown sigops until the hub recomputes them; schema 3 keeps its sigop cost. Unknown schema takes the unreadable-image path above.
 
 ## Operator

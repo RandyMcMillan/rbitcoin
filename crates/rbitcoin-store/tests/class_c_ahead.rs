@@ -1,5 +1,5 @@
-//! A header-txs append rewrites a synced partial block. The write-ahead image
-//! must survive a tear between the sidecar and the payload flush.
+//! Class C flushes publish `store/guard/class_c` before the live pages.
+//! Open restores that forward image before any slot read.
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::header_table::block_header_hash;
 use rbitcoin_store::header_table::HeaderRecord;
@@ -72,38 +72,55 @@ fn zero_header_and_block(path: &Path) {
     assert_eq!(check, [0u8; 4096]);
 }
 
+/// The Class C group pause is one process-wide slot. Tests that arm it hold
+/// this lock from arm to release, so two of them cannot share the slot.
+#[cfg(debug_assertions)]
+fn pause_slot() -> std::sync::MutexGuard<'static, ()> {
+    static SLOT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SLOT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Releases the group pause on drop, including on unwind.
+#[cfg(debug_assertions)]
+struct ReleasePause;
+
+#[cfg(debug_assertions)]
+impl Drop for ReleasePause {
+    fn drop(&mut self) {
+        rbitcoin_store::chain::release_class_c_group_pause();
+    }
+}
+
+fn class_c_mark(dir: &Path) -> PathBuf {
+    dir.join(rbitcoin_store::page_guard::CLASS_C_MARK)
+}
+
 #[test]
-fn open_drops_header_txs_sidecars_from_different_flushes() {
+fn crash_between_header_txs_first_and_count_is_one_mark() {
     let dir = tmp();
-    let count_side = dir.join("header_txs_count.body.ahead");
-    let first_side = dir.join("header_txs_first.body.ahead");
-    let saved_count = {
+    let body = dir.join("header_txs_first.body");
+    {
         let t = rbitcoin_store::HeaderTxsTable::create(&dir).unwrap();
         let write = rbitcoin_store::ClassCWrite::for_test();
         t.put_range(&write, Fk(1), Fk(1), 1).unwrap();
         t.flush().unwrap();
         t.put_range(&write, Fk(1), Fk(5), 3).unwrap();
-        rbitcoin_store::chain::fail_next_array_flush_after_ahead(
-            &dir.join("header_txs_first.body"),
-        );
+        rbitcoin_store::chain::fail_next_header_txs_flush_after_first(&body);
         assert!(t.flush().is_err());
-        let saved = std::fs::read(&count_side).unwrap();
-        t.put_range(&write, Fk(1), Fk(8), 4).unwrap();
-        rbitcoin_store::chain::fail_next_array_flush_after_ahead(
-            &dir.join("header_txs_first.body"),
+        assert!(
+            class_c_mark(&dir).is_file(),
+            "first and count share one mark"
         );
-        assert!(t.flush().is_err());
-        saved
-    };
-    std::fs::write(&count_side, &saved_count).unwrap();
+    }
+    zero_header_and_block(&dir.join("header_txs_first.body"));
+    zero_header_and_block(&dir.join("header_txs_count.body"));
     let t = rbitcoin_store::HeaderTxsTable::open(&dir).unwrap();
     assert_eq!(
         (t.first.get(0).unwrap(), t.count.get(0).unwrap()),
-        (1, 1),
-        "open restored first from one flush and count from another"
+        (5, 3),
+        "open observed a split first/count pair"
     );
-    assert!(!first_side.exists());
-    assert!(!count_side.exists());
+    assert!(!class_c_mark(&dir).exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -141,11 +158,18 @@ fn header_txs_flush_dirsyncs_the_pair_once() {
     t.flush().unwrap();
     let dirs = rbitcoin_store::file::take_fsynced_dirs();
     #[cfg(unix)]
-    assert_eq!(
-        dirs.len(),
-        2,
-        "the pair should sync the directory once after the sidecars and once after the unlinks, got {dirs:?}"
-    );
+    {
+        let guard = dir.join("guard");
+        assert_eq!(
+            dirs.iter().filter(|p| p.as_path() == guard).count(),
+            2,
+            "the pair should sync guard/ once after the sidecars and once after the unlinks, got {dirs:?}"
+        );
+        assert!(
+            dirs.iter().any(|p| p == &dir),
+            "creating guard/ must sync the store directory, got {dirs:?}"
+        );
+    }
     // Windows `fsync_parent_dir` is a no-op, so the trace stays empty.
     #[cfg(not(unix))]
     drop(dirs);
@@ -196,8 +220,7 @@ fn torn_header_txs_block_restores_from_ahead_image() {
             s.header_txs.flush().is_err(),
             "the failpoint must stop before the payload flush"
         );
-        assert!(dir.join("header_txs_first.body.ahead").is_file());
-        assert!(dir.join("header_txs_count.body.ahead").is_file());
+        assert!(class_c_mark(&dir).is_file());
     }
 
     zero_header_and_block(&dir.join("header_txs_first.body"));
@@ -223,8 +246,7 @@ fn torn_header_txs_block_restores_from_ahead_image() {
         Some((1, 1)),
         "the page-zero range was not restored"
     );
-    assert!(!dir.join("header_txs_first.body.ahead").exists());
-    assert!(!dir.join("header_txs_count.body.ahead").exists());
+    assert!(!class_c_mark(&dir).exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -258,7 +280,7 @@ fn leftover_ahead_pages_survive_a_later_write() {
             s.header_txs.flush().is_err(),
             "the failpoint must leave the sidecar after a successful payload"
         );
-        assert!(dir.join("header_txs_first.body.ahead").is_file());
+        assert!(class_c_mark(&dir).is_file());
 
         let (rec, ins, outs) = coinbase(1100);
         let tx = s
@@ -316,13 +338,17 @@ fn confirmed_flush_dirsyncs_the_sidecar_before_the_payload() {
     let full = rbitcoin_store::file::take_fsynced_dirs();
     #[cfg(unix)]
     {
-        assert_eq!(
-            before_payload.len(),
-            1,
-            "the sidecar rename must reach the directory before the payload, got {before_payload:?}"
+        let guard = dir.path.join("guard");
+        assert!(
+            before_payload.iter().any(|p| p == &guard),
+            "the sidecar rename must reach guard/ before the payload, got {before_payload:?}"
+        );
+        assert!(
+            before_payload.iter().any(|p| p == dir.path()),
+            "creating guard/ must sync the store directory, got {before_payload:?}"
         );
         assert_eq!(
-            full.len(),
+            full.iter().filter(|p| p.as_path() == guard).count(),
             2,
             "one sync after the sidecar and one after the unlink, got {full:?}"
         );
@@ -354,7 +380,7 @@ fn torn_confirmed_page_zero_restores_from_ahead_image() {
             t.flush().is_err(),
             "the failpoint must stop before the payload flush"
         );
-        assert!(dir.path.join("confirmed.body.ahead").is_file());
+        assert!(class_c_mark(&dir.path).is_file());
     }
 
     zero_header_and_block(&path);
@@ -367,7 +393,7 @@ fn torn_confirmed_page_zero_restores_from_ahead_image() {
         "the committed previous tip was lost"
     );
     assert_eq!(t.get(Height(600)).unwrap(), Some(Fk(601)));
-    assert!(!dir.path.join("confirmed.body.ahead").exists());
+    assert!(!class_c_mark(&dir.path).exists());
 }
 
 /// A disconnect to a length that ends on a 4 KiB boundary writes no slot,
@@ -390,7 +416,7 @@ fn torn_page_zero_after_a_block_aligned_shrink_restores() {
         t.disconnect_tip(&write, Height(510)).unwrap();
         rbitcoin_store::chain::fail_next_array_flush_after_ahead(&path);
         assert!(t.flush().is_err(), "the failpoint must stop the flush");
-        assert!(dir.path.join("confirmed.body.ahead").is_file());
+        assert!(class_c_mark(&dir.path).is_file());
     }
 
     zero_header_and_block(&path);
@@ -416,13 +442,13 @@ fn torn_page_zero_after_a_shrink_to_empty_restores() {
         t.disconnect_tip(&write, Height(0)).unwrap();
         rbitcoin_store::chain::fail_next_array_flush_after_ahead(&path);
         assert!(t.flush().is_err(), "the failpoint must stop the flush");
-        assert!(dir.path.join("confirmed.body.ahead").is_file());
+        assert!(class_c_mark(&dir.path).is_file());
     }
 
     zero_header_and_block(&path);
     let t = ConfirmedTable::open(&dir.path).unwrap();
     assert_eq!(t.tip_height(), None);
-    assert!(!dir.path.join("confirmed.body.ahead").exists());
+    assert!(!class_c_mark(&dir.path).exists());
 }
 
 /// A crash after the payload landed and before the sidecar was removed:
@@ -444,14 +470,14 @@ fn confirmed_ahead_left_after_the_payload_replays_the_same_state() {
             t.flush().is_err(),
             "the failpoint must stop before the sidecar is removed"
         );
-        assert!(dir.path.join("confirmed.body.ahead").is_file());
+        assert!(class_c_mark(&dir.path).is_file());
     }
 
     let t = ConfirmedTable::open(&dir.path).unwrap();
     assert_eq!(t.tip_height(), Some(Height(519)));
     assert_eq!(t.get(Height(0)).unwrap(), Some(Fk(1)));
     assert_eq!(t.get(Height(519)).unwrap(), Some(Fk(520)));
-    assert!(!dir.path.join("confirmed.body.ahead").exists());
+    assert!(!class_c_mark(&dir.path).exists());
 }
 
 #[test]
@@ -460,6 +486,9 @@ fn one_header_txs_failpoint_does_not_clear_another_path() {
     let b = rbitcoin_store::testutil::TempDir::labeled("ahead-b").unwrap();
     let ta = rbitcoin_store::HeaderTxsTable::create(&a.path).unwrap();
     let tb = rbitcoin_store::HeaderTxsTable::create(&b.path).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    ta.put_range(&write, Fk(1), Fk(1), 1).unwrap();
+    tb.put_range(&write, Fk(1), Fk(1), 1).unwrap();
     let pa = a.path.join("header_txs_first.body");
     let pb = b.path.join("header_txs_first.body");
     rbitcoin_store::chain::fail_next_array_flush_after_ahead(&pa);
@@ -476,4 +505,497 @@ fn one_header_txs_failpoint_does_not_clear_another_path() {
         ta.flush().is_err(),
         "arming path b cleared the payload failpoint for path a"
     );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn one_page_flush_restores_a_mixed_committed_slot() {
+    use rbitcoin_primitives::Height;
+    use rbitcoin_store::chain::ConfirmedTable;
+    let dir = rbitcoin_store::testutil::TempDir::labeled("c-one-page").unwrap();
+    let path = dir.path.join("confirmed.body");
+    {
+        let t = ConfirmedTable::create(&dir.path).unwrap();
+        let write = rbitcoin_store::ClassCWrite::for_test();
+        for h in 0..80u32 {
+            t.set(&write, Height(h), Fk(u64::from(h) + 1)).unwrap();
+        }
+        t.flush().unwrap();
+        t.set(&write, Height(40), Fk(9_001)).unwrap();
+        rbitcoin_store::chain::fail_next_array_flush_after_ahead(&path);
+        assert!(t.flush().is_err());
+        assert!(class_c_mark(&dir.path).is_file());
+    }
+    zero_header_and_block(&path);
+    let t = ConfirmedTable::open(&dir.path).unwrap();
+    assert_eq!(t.get(Height(39)).unwrap(), Some(Fk(40)));
+    assert_eq!(t.get(Height(40)).unwrap(), Some(Fk(9_001)));
+    assert_eq!(t.get(Height(41)).unwrap(), Some(Fk(42)));
+    assert_eq!(t.tip_height(), Some(Height(79)));
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn flush_from_first_slot_restores_a_mixed_committed_slot() {
+    use rbitcoin_primitives::Height;
+    use rbitcoin_store::chain::ConfirmedTable;
+    let dir = rbitcoin_store::testutil::TempDir::labeled("c-from-first").unwrap();
+    let path = dir.path.join("confirmed.body");
+    {
+        let t = ConfirmedTable::create(&dir.path).unwrap();
+        let write = rbitcoin_store::ClassCWrite::for_test();
+        for h in 0..600u32 {
+            t.set(&write, Height(h), Fk(u64::from(h) + 1)).unwrap();
+        }
+        t.flush().unwrap();
+        t.set(&write, Height(0), Fk(9_002)).unwrap();
+        rbitcoin_store::chain::fail_next_array_flush_after_ahead(&path);
+        assert!(t.flush().is_err());
+        assert!(class_c_mark(&dir.path).is_file());
+    }
+    zero_header_and_block(&path);
+    let t = ConfirmedTable::open(&dir.path).unwrap();
+    assert_eq!(t.get(Height(0)).unwrap(), Some(Fk(9_002)));
+    assert_eq!(t.get(Height(1)).unwrap(), Some(Fk(2)));
+    assert_eq!(t.get(Height(599)).unwrap(), Some(Fk(600)));
+    assert_eq!(t.tip_height(), Some(Height(599)));
+}
+
+/// `HeaderTxsTable::flush` takes the write lock itself. This pause is inside
+/// the grouped flush `flush_header_archive` used to call without that lock.
+#[cfg(debug_assertions)]
+#[test]
+fn header_txs_grouped_flush_holds_the_write_lock() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let dir = tmp();
+    let store = Arc::new(Store::create_tiny(&dir).unwrap());
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    store.header_txs.put_range(&write, Fk(1), Fk(1), 1).unwrap();
+
+    let _slot = pause_slot();
+    rbitcoin_store::chain::arm_class_c_group_pause(&dir);
+    let _release = ReleasePause;
+    let flushing = Arc::clone(&store);
+    let flush = std::thread::spawn(move || flushing.flush_header_archive());
+    assert!(
+        rbitcoin_store::chain::wait_class_c_group_paused(Duration::from_secs(5)),
+        "flush_header_archive did not pause between header_txs columns"
+    );
+    assert!(
+        store.header_txs.write_lock_held(),
+        "flush_header_archive is between columns without the write lock"
+    );
+    rbitcoin_store::chain::release_class_c_group_pause();
+    flush.join().unwrap().unwrap();
+    store.header_txs.put_range(&write, Fk(2), Fk(2), 1).unwrap();
+    assert_eq!(store.header_txs.get_range(Fk(2)).unwrap(), Some((Fk(2), 1)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A slot set after the page images and before the live write dirties a page
+/// the mark does not hold. The flush writes only the span it imaged, and the
+/// late slot stays dirty for the next flush.
+#[cfg(debug_assertions)]
+#[test]
+fn flush_writes_only_the_pages_it_imaged() {
+    use rbitcoin_primitives::Height;
+    use rbitcoin_store::chain::ConfirmedTable;
+    use rbitcoin_store::file::TracedWrite;
+    use std::time::Duration;
+
+    let dir = rbitcoin_store::testutil::TempDir::labeled("c-late-slot").unwrap();
+    let path = dir.path.join("confirmed.body");
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    {
+        let t = ConfirmedTable::create(&dir.path).unwrap();
+        for h in 0..2000u32 {
+            t.set(&write, Height(h), Fk(u64::from(h) + 1)).unwrap();
+        }
+        t.flush().unwrap();
+        // Slot 1500 sits on page 2. Page 1 holds slots 510..1021.
+        t.set(&write, Height(1500), Fk(9_001)).unwrap();
+
+        let _slot = pause_slot();
+        rbitcoin_store::chain::arm_class_c_group_pause(&dir.path);
+        let _release = ReleasePause;
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                // Releases the paused flush even if an assert below panics.
+                let _release = ReleasePause;
+                assert!(
+                    rbitcoin_store::chain::wait_class_c_group_paused(Duration::from_secs(5)),
+                    "the flush did not pause after its page images"
+                );
+                let write = rbitcoin_store::ClassCWrite::for_test();
+                t.set(&write, Height(600), Fk(9_002)).unwrap();
+            });
+            rbitcoin_store::file::arm_write_trace();
+            t.flush().unwrap();
+            let trace = rbitcoin_store::file::take_write_trace();
+            for w in trace {
+                if let TracedWrite::Write {
+                    path: p,
+                    offset,
+                    len,
+                } = w
+                {
+                    if p == path {
+                        assert!(
+                            offset + len <= 4096 || offset >= 8192,
+                            "the flush wrote page 1, which its mark does not hold: {offset}+{len}"
+                        );
+                    }
+                }
+            }
+        });
+        t.flush().unwrap();
+    }
+    let t = ConfirmedTable::open(&dir.path).unwrap();
+    assert_eq!(t.get(Height(600)).unwrap(), Some(Fk(9_002)));
+    assert_eq!(t.get(Height(1500)).unwrap(), Some(Fk(9_001)));
+}
+
+/// A batch stored after the page images and before the write moves a slot
+/// inside the imaged span and one below it. The flush writes the state it
+/// imaged, not the live slot beside a skipped one, so disk never holds a pair
+/// RAM did not. The batch stays dirty for the next flush.
+#[cfg(debug_assertions)]
+#[test]
+fn imaged_flush_writes_the_imaged_state() {
+    use rbitcoin_primitives::Height;
+    use rbitcoin_store::array_table::ArrayTable;
+    use rbitcoin_store::chain::ConfirmedTable;
+    use std::time::Duration;
+
+    let dir = rbitcoin_store::testutil::TempDir::labeled("c-imaged-state").unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    let t = ConfirmedTable::create(&dir.path).unwrap();
+    for h in 0..2000u32 {
+        t.set(&write, Height(h), Fk(u64::from(h) + 1)).unwrap();
+    }
+    t.flush().unwrap();
+    // Slot 1500 is the dirty span. Slot 600 sits below it, on page 1.
+    t.set(&write, Height(1500), Fk(9_001)).unwrap();
+    let disk = |i: u64| {
+        let mut buf = [0u8; 8];
+        t.arr.file.read_at(ArrayTable::offset(i), &mut buf).unwrap();
+        u64::from_le_bytes(buf)
+    };
+
+    let _slot = pause_slot();
+    rbitcoin_store::chain::arm_class_c_group_pause(&dir.path);
+    let _release = ReleasePause;
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let _release = ReleasePause;
+            assert!(
+                rbitcoin_store::chain::wait_class_c_group_paused(Duration::from_secs(5)),
+                "the flush did not pause after its page images"
+            );
+            let write = rbitcoin_store::ClassCWrite::for_test();
+            t.set_many(
+                &write,
+                &[(Height(600), Fk(9_002)), (Height(1500), Fk(9_003))],
+            )
+            .unwrap();
+        });
+        t.flush().unwrap();
+    });
+    assert_eq!(
+        (disk(600), disk(1500)),
+        (601, 9_001),
+        "the flush wrote a live slot beside a slot it skipped"
+    );
+    t.flush().unwrap();
+    assert_eq!((disk(600), disk(1500)), (9_002, 9_003));
+}
+
+/// An fd-only `header_txs` pair lands under one mark. A failure after the
+/// `first` column is written and before `count` is must not leave the pair
+/// split: both forward images are armed by then, so reopen reads the new pair.
+#[cfg(debug_assertions)]
+#[test]
+fn fd_only_header_txs_pair_is_one_mark() {
+    use rbitcoin_store::chain::HeaderTxsTable;
+    let dir = rbitcoin_store::testutil::TempDir::labeled("c-fd-pair").unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    {
+        let t = HeaderTxsTable::create(&dir.path).unwrap();
+        t.put_range(&write, Fk(1), Fk(1), 1).unwrap();
+        t.flush().unwrap();
+    }
+    {
+        let t = rbitcoin_store::array_table::with_class_c_inram_max_bytes(0, || {
+            HeaderTxsTable::open(&dir.path).unwrap()
+        });
+        rbitcoin_store::chain::fail_next_fd_write_before_live(
+            &dir.path.join("header_txs_count.body"),
+        );
+        rbitcoin_store::page_guard::arm_store_mark_trace();
+        assert!(t.put_range(&write, Fk(1), Fk(5), 3).is_err());
+        let armed = rbitcoin_store::page_guard::take_armed_store_marks();
+        assert_eq!(
+            armed,
+            vec![rbitcoin_store::page_guard::CLASS_C_MARK.to_string()],
+            "the pair armed more than one mark"
+        );
+    }
+    assert!(rbitcoin_store::page_guard::restore_store_group(
+        &dir.path,
+        rbitcoin_store::page_guard::CLASS_C_MARK,
+    )
+    .unwrap());
+    let t = HeaderTxsTable::open(&dir.path).unwrap();
+    assert_eq!(t.get_range(Fk(1)).unwrap(), Some((Fk(5), 3)));
+}
+
+/// A `confirmed` table of `n` flushed slots, reopened fd-only.
+#[cfg(debug_assertions)]
+fn fd_only_confirmed(dir: &Path, n: u32) -> rbitcoin_store::chain::ConfirmedTable {
+    use rbitcoin_primitives::Height;
+    use rbitcoin_store::chain::ConfirmedTable;
+    {
+        let t = ConfirmedTable::create(dir).unwrap();
+        let write = rbitcoin_store::ClassCWrite::for_test();
+        for h in 0..n {
+            t.set(&write, Height(h), Fk(u64::from(h) + 1)).unwrap();
+        }
+        t.flush().unwrap();
+    }
+    let t = rbitcoin_store::array_table::with_class_c_inram_max_bytes(0, || {
+        ConfirmedTable::open(dir).unwrap()
+    });
+    assert_eq!(t.arr.l2_resident_bytes(), 0, "not fd-only");
+    t
+}
+
+/// Two far-apart overwrites in one fd write image their own two pages, not
+/// every page between them.
+#[cfg(debug_assertions)]
+#[test]
+fn sparse_fd_write_images_only_its_pages() {
+    use rbitcoin_primitives::Height;
+    let dir = rbitcoin_store::testutil::TempDir::labeled("c-fd-sparse").unwrap();
+    let t = fd_only_confirmed(&dir.path, 5000);
+    rbitcoin_store::chain::fail_next_fd_write_before_live(&dir.path.join("confirmed.body"));
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    // Slot 10 is on page 0 and slot 4000 on page 7.
+    assert!(t
+        .set_many(&write, &[(Height(10), Fk(7)), (Height(4000), Fk(8))])
+        .is_err());
+    let mark = std::fs::metadata(class_c_mark(&dir.path)).unwrap().len();
+    assert!(
+        mark < 3 * 4096,
+        "two slots armed {mark} bytes of page images"
+    );
+}
+
+/// A failed fd write leaves its forward mark armed. An fd-only truncate is
+/// refused until reopen restores that mark, as a later fd write is: the
+/// restore would put the old length back over the shorter one.
+#[cfg(debug_assertions)]
+#[test]
+fn fd_truncate_refuses_an_armed_mark() {
+    use rbitcoin_primitives::Height;
+    let dir = rbitcoin_store::testutil::TempDir::labeled("c-fd-trunc").unwrap();
+    let t = fd_only_confirmed(&dir.path, 5000);
+    rbitcoin_store::chain::fail_next_fd_write_before_live(&dir.path.join("confirmed.body"));
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    assert!(t.set(&write, Height(10), Fk(7)).is_err());
+    assert!(class_c_mark(&dir.path).is_file());
+    match t.disconnect_tip(&write, Height(4999)) {
+        Err(rbitcoin_store::error::StoreError::Rejected(_)) => {}
+        other => panic!("truncate under an armed mark: {other:?}"),
+    }
+    assert_eq!(t.tip_height(), Some(Height(4999)));
+}
+
+/// A clear whose `guard/` sync fails has unlinked the mark, but the unlink
+/// may not be durable: a crash can bring the mark back. An fd-only truncate
+/// stays refused until reopen even though no mark file is left to see.
+#[cfg(debug_assertions)]
+#[test]
+fn fd_truncate_refuses_after_a_failed_mark_dir_sync() {
+    use rbitcoin_primitives::Height;
+    let dir = rbitcoin_store::testutil::TempDir::labeled("c-fd-dirsync").unwrap();
+    let t = fd_only_confirmed(&dir.path, 5000);
+    rbitcoin_store::page_guard::fail_next_mark_dir_sync(&dir.path.join("guard"));
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    assert!(t.set(&write, Height(10), Fk(7)).is_err());
+    assert!(!class_c_mark(&dir.path).exists());
+    match t.disconnect_tip(&write, Height(4999)) {
+        Err(rbitcoin_store::error::StoreError::Rejected(_)) => {}
+        other => panic!("truncate after a failed guard/ sync: {other:?}"),
+    }
+    assert_eq!(t.tip_height(), Some(Height(4999)));
+    assert!(t.set(&write, Height(11), Fk(8)).is_err());
+    assert!(t.flush().is_err(), "flush passed over a failed fd write");
+}
+
+/// An fd-only pair write that fails after `first` is written leaves `first`
+/// new and `count` old. Reads of the pair and a flush refuse until reopen,
+/// which restores the armed mark.
+#[cfg(debug_assertions)]
+#[test]
+fn failed_fd_header_txs_pair_refuses_reads_until_reopen() {
+    use rbitcoin_store::chain::HeaderTxsTable;
+    let dir = rbitcoin_store::testutil::TempDir::labeled("c-fd-pair-read").unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    {
+        let t = HeaderTxsTable::create(&dir.path).unwrap();
+        t.put_range(&write, Fk(1), Fk(1), 1).unwrap();
+        t.flush().unwrap();
+    }
+    {
+        let t = rbitcoin_store::array_table::with_class_c_inram_max_bytes(0, || {
+            HeaderTxsTable::open(&dir.path).unwrap()
+        });
+        rbitcoin_store::chain::fail_next_fd_write_before_live(
+            &dir.path.join("header_txs_count.body"),
+        );
+        assert!(t.put_range(&write, Fk(1), Fk(5), 3).is_err());
+        match t.get_range(Fk(1)) {
+            Err(rbitcoin_store::error::StoreError::Rejected(_)) => {}
+            other => panic!("read of a torn pair: {other:?}"),
+        }
+        assert!(t.flush().is_err(), "flush passed over a torn pair");
+    }
+    let t = HeaderTxsTable::open(&dir.path).unwrap();
+    assert_eq!(t.get_range(Fk(1)).unwrap(), Some((Fk(5), 3)));
+}
+
+/// Each `header_txs` column picks RAM or fd from its own length. A pair whose
+/// lengths straddle the RAM cap would open as one fd column and one RAM
+/// column, and no single mark covers a write to that pair. Open refuses it.
+#[test]
+fn header_txs_pair_on_two_tiers_refuses_open() {
+    use rbitcoin_store::chain::HeaderTxsTable;
+    let dir = rbitcoin_store::testutil::TempDir::labeled("c-mixed-pair").unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    {
+        let t = HeaderTxsTable::create(&dir.path).unwrap();
+        t.put_range(&write, Fk(1), Fk(1), 1).unwrap();
+        t.first.set_zero_gap(&write, 1, 2).unwrap();
+        t.flush().unwrap();
+        assert_eq!((t.first.len(), t.count.len()), (2, 1));
+    }
+    let opened = rbitcoin_store::array_table::with_class_c_inram_max_bytes(8, || {
+        HeaderTxsTable::open(&dir.path)
+    });
+    match opened {
+        Err(rbitcoin_store::error::StoreError::Corrupt(m)) => {
+            assert!(m.contains("header_txs"), "{m}")
+        }
+        Err(other) => panic!("wrong refusal: {other}"),
+        Ok(_) => panic!("open accepted a header_txs pair split across tiers"),
+    }
+}
+
+/// Class A first on the fd tier: an fd-only `header_txs` pair is durable
+/// when its put returns, so the creates it names are synced before it. A
+/// failed Class A sync leaves no range naming them.
+#[cfg(debug_assertions)]
+#[test]
+fn fd_header_ranges_sync_class_a_before_the_pair() {
+    let dir = rbitcoin_store::testutil::TempDir::labeled("c-fd-class-a").unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    {
+        let s = Store::create_tiny(&dir.path).unwrap();
+        s.put_tx_full_batch_indexed(&[coinbase(1)], false).unwrap();
+        s.put_header_ranges(&write, &[(Fk(1), Fk(1), 1)]).unwrap();
+        s.flush_header_archive().unwrap();
+    }
+    let s = rbitcoin_store::array_table::with_class_c_inram_max_bytes(0, || {
+        Store::open_tiny(&dir.path).unwrap()
+    });
+    assert_eq!(s.header_txs.first.l2_resident_bytes(), 0, "not fd-only");
+    s.put_tx_full_batch_indexed(&[coinbase(2)], false).unwrap();
+    rbitcoin_store::io_handle::arm_fail_sync(s.txs.txids.file.io_handle(), 1);
+    assert!(
+        s.put_header_ranges(&write, &[(Fk(2), Fk(2), 1)]).is_err(),
+        "an fd pair was stored over an unsynced Class A"
+    );
+    assert_eq!(s.header_txs.get_range(Fk(2)).unwrap(), None);
+}
+
+/// A group flush checks the failed-write latch under the mark lock. An fd
+/// write that fails while the flush waits for that lock leaves the flush
+/// refused, not reporting the partial write as flushed.
+#[cfg(debug_assertions)]
+#[test]
+fn flush_sees_an_fd_write_that_failed_while_it_waited() {
+    use rbitcoin_primitives::Height;
+    use std::time::Duration;
+    let _slot = pause_slot();
+    let dir = rbitcoin_store::testutil::TempDir::labeled("c-fd-hold").unwrap();
+    let t = fd_only_confirmed(&dir.path, 5000);
+    rbitcoin_store::chain::arm_class_c_hold_pause(&dir.path);
+    std::thread::scope(|scope| {
+        // Dropped before the scope joins: a failed wait still frees the worker.
+        let _release = ReleasePause;
+        let flush = scope.spawn(|| t.flush());
+        assert!(
+            rbitcoin_store::chain::wait_class_c_group_paused(Duration::from_secs(5)),
+            "flush did not reach the mark lock"
+        );
+        rbitcoin_store::chain::fail_next_fd_write_before_live(&dir.path.join("confirmed.body"));
+        let write = rbitcoin_store::ClassCWrite::for_test();
+        assert!(t.set(&write, Height(10), Fk(7)).is_err());
+        rbitcoin_store::chain::release_class_c_group_pause();
+        match flush.join().unwrap() {
+            Err(rbitcoin_store::error::StoreError::Rejected(_)) => {}
+            other => panic!("flush over a failed fd write: {other:?}"),
+        }
+    });
+}
+
+/// A pair read already waiting when an fd pair write fails between its
+/// columns checks the failed-write latch in the sample it returns, so it
+/// never returns the new `first` beside the old `count`.
+#[cfg(debug_assertions)]
+#[test]
+fn a_waiting_pair_read_sees_a_failed_fd_pair_write() {
+    use rbitcoin_store::chain::HeaderTxsTable;
+    use std::time::{Duration, Instant};
+    let dir = rbitcoin_store::testutil::TempDir::labeled("c-fd-pair-wait").unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    {
+        let t = HeaderTxsTable::create(&dir.path).unwrap();
+        t.put_range(&write, Fk(1), Fk(1), 1).unwrap();
+        t.flush().unwrap();
+    }
+    let t = rbitcoin_store::array_table::with_class_c_inram_max_bytes(0, || {
+        HeaderTxsTable::open(&dir.path).unwrap()
+    });
+    rbitcoin_store::chain::fail_next_fd_write_before_live(&dir.path.join("header_txs_count.body"));
+    std::thread::scope(|scope| {
+        // The writer stops on the mark lock with its pair counter odd.
+        let marks = rbitcoin_store::page_guard::hold_marks();
+        let writer = scope.spawn(|| {
+            let write = rbitcoin_store::ClassCWrite::for_test();
+            t.put_range(&write, Fk(1), Fk(5), 3)
+        });
+        while !t.write_lock_held() {
+            std::thread::yield_now();
+        }
+        t.watch_pair_reads();
+        let reader = scope.spawn(|| t.get_range(Fk(1)));
+        // The reader waits on the odd generation before the write fails.
+        let start = Instant::now();
+        while !t.pair_read_saw_odd() {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "the reader never saw the odd pair generation"
+            );
+            std::thread::yield_now();
+        }
+        drop(marks);
+        assert!(writer.join().unwrap().is_err());
+        match reader.join().unwrap() {
+            Err(rbitcoin_store::error::StoreError::Rejected(_)) => {}
+            other => panic!("a waiting read accepted a failed pair write: {other:?}"),
+        }
+    });
 }

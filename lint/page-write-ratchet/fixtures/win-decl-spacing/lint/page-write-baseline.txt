@@ -1,0 +1,2 @@
+crates/rbitcoin-store/src/a.rs	WriteFile	1
+crates/rbitcoin-store/src/a.rs	win_set_eof	1

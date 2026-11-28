@@ -22,7 +22,7 @@ fn shutdown_head_snapshot_error_still_returns_ok() {
     let s = Store::open_or_create_tiny(&dir).unwrap();
     let block = dir.join("tx.head").join("meta.tmp");
     std::fs::create_dir(&block).unwrap();
-    s.flush_for_shutdown()
+    s.flush_for_shutdown(true)
         .expect("a head snapshot error is logged, not returned");
     let _ = std::fs::remove_dir(&block);
 }
@@ -642,7 +642,7 @@ fn store_create_open_archive_spend_and_meta_errors() {
 
     assert_eq!(s.archived_block_count().unwrap(), 1);
     s.flush_header_archive().unwrap();
-    s.flush_for_shutdown().unwrap();
+    s.flush_for_shutdown(true).unwrap();
 
     // repair: strong not on the fence
     s.strong_tx
@@ -685,6 +685,351 @@ fn store_create_open_archive_spend_and_meta_errors() {
 }
 
 #[test]
+fn open_refuses_legacy_ahead_sidecars() {
+    for name in [
+        "confirmed.body.ahead",
+        "header_txs_first.body.ahead",
+        "header_txs_count.body.ahead",
+        "header.head.ahead",
+    ] {
+        let dir = tmp();
+        {
+            let s = Store::create_tiny(&dir).unwrap();
+            s.flush().unwrap();
+        }
+        let ahead = dir.join(name);
+        std::fs::write(&ahead, b"legacy").unwrap();
+        match Store::open_tiny(&dir) {
+            Err(StoreError::Corrupt(m)) => assert!(m.contains(name), "{name}: {m}"),
+            Ok(_) => panic!("{name} opened"),
+            Err(other) => panic!("{name}: {other}"),
+        }
+        assert!(ahead.is_file(), "{name} must stay");
+    }
+}
+
+/// The base binary wrote one `.ahead` per `header.head` generation. Open
+/// refuses a leftover generation sidecar the way it refuses the base one.
+#[test]
+fn open_refuses_a_legacy_generation_ahead_sidecar() {
+    let dir = tmp();
+    {
+        let s = Store::create_tiny(&dir).unwrap();
+        s.flush().unwrap();
+    }
+    std::fs::copy(dir.join("header.head"), dir.join("header.head.g1")).unwrap();
+    let ahead = dir.join("header.head.g1.ahead");
+    std::fs::write(&ahead, b"legacy").unwrap();
+    match Store::open_tiny(&dir) {
+        Err(StoreError::Corrupt(m)) => assert!(m.contains("header.head.gN.ahead"), "{m}"),
+        Ok(_) => panic!("header.head.g1.ahead opened"),
+        Err(other) => panic!("header.head.g1.ahead: {other}"),
+    }
+    assert!(ahead.is_file(), "header.head.g1.ahead must stay");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A header row on disk that `header.head` does not name is the crash after
+/// the body length is durable and before the head insert. Open indexes that
+/// tail with no mark, so the next put finds the row instead of appending a
+/// second one.
+#[test]
+fn open_indexes_header_rows_the_head_does_not_name() {
+    use rbitcoin_store::file::FILE_HEADER_LEN;
+    use rbitcoin_store::header_table::HEADER_RECORD_LEN;
+    let header = |hash: [u8; 32]| HeaderRecord {
+        prev_fk: Fk::NULL,
+        version: 1,
+        timestamp: 1,
+        bits: 0x1d00ffff,
+        nonce: 1,
+        merkle_root: [1u8; 32],
+        hash,
+        size: 0,
+        weight: 0,
+    };
+    let dir = tmp();
+    {
+        let s = Store::create_tiny(&dir).unwrap();
+        s.put_header(&header([0x63u8; 32])).unwrap();
+        s.flush().unwrap();
+    }
+    let late = header([0x64u8; 32]);
+    append_header_row(&dir, FILE_HEADER_LEN + HEADER_RECORD_LEN, &late);
+    assert!(!dir.join("guard").join("header.body").exists());
+    let s = Store::open_tiny(&dir).unwrap();
+    assert_eq!(s.header_count(), 2);
+    let found = s.get_header_by_hash(&late.hash).unwrap().map(|(fk, _)| fk);
+    assert_eq!(found, Some(Fk(2)), "the unnamed row is not in header.head");
+    assert_eq!(s.put_header(&late).unwrap(), Fk(2));
+    assert_eq!(s.header_count(), 2, "a second row for one hash");
+    drop(s);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The schema-24 header conversion writes a temp file and renames it. It
+/// arms no mark: the live body is untouched until the rename, and meta may
+/// still be below 31.
+#[test]
+fn v24_header_conversion_publishes_no_mark() {
+    let dir = tmp();
+    {
+        let s = Store::create_tiny(&dir).unwrap();
+        let hdr = HeaderRecord {
+            prev_fk: Fk::NULL,
+            version: 1,
+            timestamp: 1,
+            bits: 0x1d00ffff,
+            nonce: 1,
+            merkle_root: [1u8; 32],
+            hash: [0x65u8; 32],
+            size: 0,
+            weight: 0,
+        };
+        s.put_header(&hdr).unwrap();
+        s.flush().unwrap();
+    }
+    widen_header_body_to_96(&dir);
+    let _ = std::fs::remove_dir_all(dir.join("guard"));
+    rbitcoin_store::header_table::HeaderTable::rewrite_v24_body_to_88(&dir).unwrap();
+    assert!(
+        !dir.join("guard").exists(),
+        "the conversion armed a mark over its temp file"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A store with no chain yet but with a guard mark is not an incomplete
+/// first creation. An unreadable mark is refused, not wiped with the store.
+#[test]
+fn an_unreadable_mark_is_not_an_incomplete_creation() {
+    let dir = tmp();
+    {
+        let s = Store::create_tiny(&dir).unwrap();
+        s.flush().unwrap();
+    }
+    std::fs::create_dir_all(dir.join("guard")).unwrap();
+    std::fs::write(dir.join("guard/class_c"), b"not a guard file").unwrap();
+    assert!(
+        Store::open_or_create_tiny(&dir).is_err(),
+        "an unreadable mark was replaced as an incomplete creation"
+    );
+    assert!(dir.join("guard/class_c").is_file());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A crash during the very first header append can leave that row on disk
+/// with an empty `header.head`. The `guard/header.body` flag tells open to
+/// index it, not refuse the store as one whose head was lost.
+#[test]
+fn open_indexes_a_first_header_row_the_head_does_not_name() {
+    let dir = tmp();
+    let first = arm_first_header_row_mark(&dir);
+    let s = Store::open_tiny(&dir).expect("the first unindexed row was refused");
+    assert_first_header_row_indexed(&s, &first);
+    drop(s);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An open that stops after it reads the flag and before the head names the
+/// row must leave the flag. The next open then still indexes the row instead
+/// of refusing an empty head with no flag.
+#[test]
+fn open_keeps_the_header_body_mark_until_the_head_names_the_row() {
+    let dir = tmp();
+    let first = arm_first_header_row_mark(&dir);
+    let stop = dir.join("header.head.ahead");
+    std::fs::write(&stop, b"stop the open after the body replay").unwrap();
+    assert!(
+        Store::open_tiny(&dir).is_err(),
+        "the planted refusal did not stop open"
+    );
+    std::fs::remove_file(&stop).unwrap();
+    assert!(dir
+        .join(rbitcoin_store::page_guard::HEADER_BODY_MARK)
+        .exists());
+    let s = Store::open_tiny(&dir).expect("the second open refused the unindexed row");
+    assert_first_header_row_indexed(&s, &first);
+    drop(s);
+    assert!(!dir
+        .join(rbitcoin_store::page_guard::HEADER_BODY_MARK)
+        .exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An empty store with one first header row durable in `header.body`, its
+/// length published, and the `guard/header.body` flag, as a crash before
+/// the head insert leaves it.
+fn arm_first_header_row_mark(dir: &Path) -> HeaderRecord {
+    use rbitcoin_store::file::FILE_HEADER_LEN;
+    let first = loose_header(0x66);
+    {
+        let s = Store::create_tiny(dir).unwrap();
+        s.flush().unwrap();
+    }
+    let flag = dir.join(rbitcoin_store::page_guard::HEADER_BODY_MARK);
+    std::fs::create_dir_all(flag.parent().unwrap()).unwrap();
+    std::fs::write(&flag, b"").unwrap();
+    append_header_row(dir, FILE_HEADER_LEN, &first);
+    first
+}
+
+/// Write `row` at `at` in `header.body` and publish the length past it.
+fn append_header_row(dir: &Path, at: usize, row: &HeaderRecord) {
+    use rbitcoin_store::header_table::HEADER_RECORD_LEN;
+    let body = dir.join("header.body");
+    let mut bytes = std::fs::read(&body).unwrap();
+    bytes.truncate(at);
+    bytes.extend_from_slice(&row.encode());
+    let len = (at + HEADER_RECORD_LEN) as u64;
+    bytes[8..16].copy_from_slice(&len.to_le_bytes());
+    std::fs::write(&body, &bytes).unwrap();
+}
+
+fn assert_first_header_row_indexed(s: &Store, first: &HeaderRecord) {
+    let found = s.get_header_by_hash(&first.hash).unwrap().map(|(fk, _)| fk);
+    assert_eq!(found, Some(Fk(1)));
+    assert_eq!(s.put_header(first).unwrap(), Fk(1));
+    assert_eq!(s.header_count(), 1);
+}
+
+/// A `guard/sh-*` mark that does not parse is scripthash damage, not
+/// Class A damage. Open requests a scripthash rebuild, drops the scripthash
+/// marks, and opens.
+#[test]
+fn open_rebuilds_scripthash_on_a_corrupt_sh_mark() {
+    let dir = tmp();
+    {
+        let s = Store::create_tiny(&dir).unwrap();
+        s.flush().unwrap();
+    }
+    std::fs::create_dir_all(dir.join("guard")).unwrap();
+    std::fs::write(dir.join("guard/sh-ovf"), b"not a guard file").unwrap();
+    let s = Store::open_tiny(&dir).expect("a corrupt sh mark stopped open");
+    drop(s);
+    assert!(dir
+        .join(rbitcoin_store::scripthash::SH_REBUILD_NAME)
+        .is_file());
+    assert!(!dir.join("guard/sh-ovf").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A corrupt sh mark beside a torn scripthash alloc header still opens. The
+/// rebuild request comes before any scripthash file is decoded.
+#[test]
+fn open_rebuilds_scripthash_on_a_corrupt_sh_mark_and_a_torn_body() {
+    use std::io::{Seek, SeekFrom, Write};
+    let dir = tmp();
+    {
+        let s = Store::create_tiny(&dir).unwrap();
+        s.flush().unwrap();
+    }
+    std::fs::create_dir_all(dir.join("guard")).unwrap();
+    std::fs::write(dir.join("guard/sh-ovf"), b"not a guard file").unwrap();
+    let body = rbitcoin_store::scripthash::sh_ovf_body_path(&dir);
+    let mut f = std::fs::OpenOptions::new().write(true).open(&body).unwrap();
+    f.seek(SeekFrom::Start(
+        rbitcoin_store::file::FILE_HEADER_LEN as u64,
+    ))
+    .unwrap();
+    f.write_all(&[0xff; 4]).unwrap();
+    drop(f);
+    let s = Store::open_tiny(&dir).expect("a torn scripthash body stopped open");
+    drop(s);
+    assert!(dir
+        .join(rbitcoin_store::scripthash::SH_REBUILD_NAME)
+        .is_file());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Meta 31 beside a 96-byte `header.body` is not a schema-24 store. Only
+/// meta 24/25 names the old width, so open refuses the length and does not
+/// rewrite the body.
+#[test]
+fn open_refuses_a_96_byte_header_body_when_meta_is_31() {
+    let dir = tmp();
+    {
+        let s = Store::create_tiny(&dir).unwrap();
+        s.put_header(&loose_header(0x61)).unwrap();
+        s.flush().unwrap();
+    }
+    widen_header_body_to_96(&dir);
+    write_store_meta_ver(&dir, 31);
+    let before = std::fs::read(dir.join("header.body")).unwrap();
+    assert_refuses_header_body_size(&dir);
+    assert_eq!(std::fs::read(dir.join("header.body")).unwrap(), before);
+    assert_eq!(read_store_meta_ver(&dir), 31);
+}
+
+/// A corrupt length that reads as one 96-byte row must not send a modern
+/// body through the schema-24 conversion, which would keep one row of two.
+#[test]
+fn open_does_not_convert_a_modern_header_body_by_its_length() {
+    use rbitcoin_store::file::FILE_HEADER_LEN;
+    use rbitcoin_store::header_table::HEADER_RECORD_LEN_V24;
+    for ver in [30u16, 31] {
+        let dir = tmp();
+        {
+            let s = Store::create_tiny(&dir).unwrap();
+            s.put_header(&loose_header(0x71)).unwrap();
+            s.put_header(&loose_header(0x72)).unwrap();
+            s.flush().unwrap();
+        }
+        write_store_meta_ver(&dir, ver);
+        let body = dir.join("header.body");
+        let mut bytes = std::fs::read(&body).unwrap();
+        let forged = FILE_HEADER_LEN as u64 + HEADER_RECORD_LEN_V24 as u64;
+        bytes[8..16].copy_from_slice(&forged.to_le_bytes());
+        std::fs::write(&body, &bytes).unwrap();
+        assert_refuses_header_body_size(&dir);
+        assert_eq!(std::fs::read(&body).unwrap(), bytes, "meta {ver}");
+    }
+}
+
+fn loose_header(byte: u8) -> HeaderRecord {
+    HeaderRecord {
+        prev_fk: Fk::NULL,
+        version: 1,
+        timestamp: 1,
+        bits: 0x1d00ffff,
+        nonce: 1,
+        merkle_root: [1u8; 32],
+        hash: [byte; 32],
+        size: 0,
+        weight: 0,
+    }
+}
+
+fn assert_refuses_header_body_size(dir: &Path) {
+    match Store::open_tiny(dir) {
+        Err(StoreError::Corrupt(m)) => assert_eq!(m, "header body size"),
+        Err(other) => panic!("wrong refusal: {other}"),
+        Ok(_) => panic!("open accepted a header body length that is not 88-byte rows"),
+    }
+}
+
+fn widen_header_body_to_96(dir: &Path) {
+    use rbitcoin_store::file::FILE_HEADER_LEN;
+    use rbitcoin_store::header_table::{HEADER_RECORD_LEN, HEADER_RECORD_LEN_V24};
+    let path = dir.join("header.body");
+    let bytes = std::fs::read(&path).unwrap();
+    let logical = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+    assert!(logical <= bytes.len() && logical >= FILE_HEADER_LEN);
+    let body = &bytes[FILE_HEADER_LEN..logical];
+    assert_eq!(body.len() % HEADER_RECORD_LEN, 0);
+    let n = body.len() / HEADER_RECORD_LEN;
+    let mut out = bytes[..FILE_HEADER_LEN].to_vec();
+    for i in 0..n {
+        let start = i * HEADER_RECORD_LEN;
+        out.extend_from_slice(&body[start..start + HEADER_RECORD_LEN]);
+        out.extend_from_slice(&[0u8; HEADER_RECORD_LEN_V24 - HEADER_RECORD_LEN]);
+    }
+    let new_logical = (FILE_HEADER_LEN + n * HEADER_RECORD_LEN_V24) as u64;
+    out[8..16].copy_from_slice(&new_logical.to_le_bytes());
+    std::fs::write(&path, &out).unwrap();
+}
+
+#[test]
 fn open_schema24_occupied_creates_zero_txstat() {
     let dir = tmp();
     {
@@ -714,7 +1059,7 @@ fn poke_logical_len(path: &Path, logical: u64) {
 }
 
 /// Schema 27 is master without the spend log. Opening it here rewrites meta
-/// to 30 so that build refuses the directory instead of writing under the log.
+/// to the current schema so that build refuses the directory instead of writing under the log.
 #[test]
 fn schema_27_rewrites_meta_so_an_older_build_refuses() {
     let dir = tmp();
@@ -725,13 +1070,91 @@ fn schema_27_rewrites_meta_so_an_older_build_refuses() {
     write_store_meta_ver(&dir, 27);
     let s = Store::open_tiny(&dir).unwrap();
     drop(s);
+    assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Every `RBT1` stamp under `dir`, as (file, offset, version).
+fn store_stamps(dir: &Path) -> Vec<(std::path::PathBuf, usize, u16)> {
+    let mut out = Vec::new();
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        for ent in std::fs::read_dir(&d).unwrap() {
+            let p = ent.unwrap().path();
+            if p.is_dir() {
+                todo.push(p);
+                continue;
+            }
+            let raw = std::fs::read(&p).unwrap();
+            for at in 0..raw.len().saturating_sub(5) {
+                if raw[at..at + 4] == STORE_MAGIC {
+                    out.push((
+                        p.clone(),
+                        at,
+                        u16::from_le_bytes([raw[at + 4], raw[at + 5]]),
+                    ));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Rewrite every stamp under `dir` to `ver`, as a store that binary wrote.
+fn restamp_store(dir: &Path, ver: u16) {
+    let mut by_file: std::collections::HashMap<std::path::PathBuf, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (p, at, _) in store_stamps(dir) {
+        by_file.entry(p).or_default().push(at);
+    }
+    for (p, ats) in by_file {
+        let mut raw = std::fs::read(&p).unwrap();
+        for at in ats {
+            raw[at + 4..at + 6].copy_from_slice(&ver.to_le_bytes());
+        }
+        std::fs::write(&p, raw).unwrap();
+    }
+}
+
+/// A plain open of a schema-30 store rewrites `meta` to 31, so a 0.9 binary
+/// refuses a datadir this binary has opened, even one it wrote no mark into.
+#[test]
+fn plain_open_of_meta_30_rewrites_meta_to_31() {
+    let dir = tmp();
+    {
+        let s = Store::create_tiny(&dir).unwrap();
+        s.flush().unwrap();
+    }
+    restamp_store(&dir, 30);
     assert_eq!(read_store_meta_ver(&dir), 30);
-    assert_eq!(SCHEMA_VERSION, 30);
+    drop(Store::open_tiny(&dir).unwrap());
+    assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
+    assert_eq!(SCHEMA_VERSION, 31);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Open moves a schema-30 `meta` to 31 before anything else it writes, so
+/// no page-guard mark is ever on disk beside a `meta` a 30 binary opens. An
+/// open that fails after that point leaves 31.
+#[test]
+fn open_of_meta_30_writes_31_before_a_later_failure() {
+    let dir = tmp();
+    {
+        let s = Store::create_tiny(&dir).unwrap();
+        s.flush().unwrap();
+    }
+    write_store_meta_ver(&dir, 30);
+    let delta = dir.join("spent.delta");
+    std::fs::remove_dir_all(&delta).unwrap();
+    std::fs::write(&delta, b"x").unwrap();
+    assert!(Store::open_tiny(&dir).is_err());
+    assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A 26 datadir whose witness locator is already the finished cut must open,
-/// keep the creates, and rewrite meta to 30. A 26 binary wipes that layout.
+/// keep the creates, and rewrite meta to the current schema. A 26 binary
+/// wipes that layout.
 #[test]
 fn pruned_schema_26_rewrites_meta_before_the_creates_are_read() {
     let dir = tmp();
@@ -758,8 +1181,7 @@ fn pruned_schema_26_rewrites_meta_before_the_creates_are_read() {
     let s = Store::open_tiny(&dir).unwrap();
     assert_eq!(s.txs.count(), 1, "schema 26 prune open must keep creates");
     drop(s);
-    assert_eq!(read_store_meta_ver(&dir), 30);
-    assert_eq!(SCHEMA_VERSION, 30);
+    assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
     let synced = rbitcoin_store::file::take_fsynced_dirs();
     assert!(
         synced.iter().any(|p| p == dir.path()),
@@ -2469,6 +2891,49 @@ fn empty_header() -> HeaderRecord {
         size: 0,
         weight: 0,
     }
+}
+
+/// A store with no `meta` but a published guard mark is not an untouched
+/// first creation. Open must refuse it and leave the mark and files.
+#[test]
+fn missing_meta_with_guard_mark_is_kept() {
+    let dir = tmp();
+    {
+        let s = Store::create_tiny(&dir).unwrap();
+        s.flush().unwrap();
+    }
+    std::fs::remove_file(dir.join("meta")).unwrap();
+    std::fs::create_dir_all(dir.join("guard")).unwrap();
+    std::fs::write(dir.join("guard").join("class_c"), b"mark").unwrap();
+    assert!(
+        Store::open_or_create_tiny(&dir).is_err(),
+        "a guard mark without meta must not be replaced by a fresh store"
+    );
+    assert_eq!(
+        std::fs::read(dir.join("guard").join("class_c")).unwrap(),
+        b"mark"
+    );
+    assert!(!dir.join("meta").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `guard` that cannot be listed may hold a mark. Open must return that
+/// error, not treat the directory as empty and create a store over it.
+#[test]
+fn missing_meta_with_an_unlistable_guard_is_kept() {
+    let dir = tmp();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("guard"), b"not a directory").unwrap();
+    assert!(
+        Store::open_or_create_tiny(&dir).is_err(),
+        "a guard that cannot be read must not be replaced by a fresh store"
+    );
+    assert_eq!(
+        std::fs::read(dir.join("guard")).unwrap(),
+        b"not a directory"
+    );
+    assert!(!dir.join("meta").exists());
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

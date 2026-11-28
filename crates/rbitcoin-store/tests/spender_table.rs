@@ -2,6 +2,7 @@ use rbitcoin_primitives::Fk;
 use rbitcoin_store::error::StoreError;
 use rbitcoin_store::file::FILE_HEADER_LEN;
 use rbitcoin_store::spender_table::*;
+use rbitcoin_store::Store;
 
 #[test]
 fn append_get_chain() {
@@ -49,20 +50,14 @@ fn append_get_chain() {
 
 #[test]
 fn open_rejects_bad_body_size() {
-    let dir = std::env::temp_dir().join(format!(
-        "rbitcoin-spender-bad-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let t = SpenderTable::create(&dir).unwrap();
-    t.append(Fk(1), 0, Fk::NULL).unwrap();
-    drop(t);
+    let dir = rbitcoin_store::testutil::TempDir::labeled("spender-bad-size").unwrap();
+    {
+        let s = Store::create_tiny(dir.path()).unwrap();
+        s.spenders.append(Fk(1), 0, Fk::NULL).unwrap();
+        s.spenders.flush().unwrap();
+    }
     // Shrink below HWM so open clamps logical_len to a non-multiple of 16.
-    let body = dir.join("spent.ovf");
+    let body = dir.path().join("spent.ovf");
     std::fs::OpenOptions::new()
         .write(true)
         .open(&body)
@@ -70,10 +65,9 @@ fn open_rejects_bad_body_size() {
         .set_len((FILE_HEADER_LEN + 3) as u64)
         .unwrap();
     assert!(matches!(
-        SpenderTable::open(&dir),
+        SpenderTable::open(dir.path()),
         Err(StoreError::Corrupt(_))
     ));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -145,4 +139,170 @@ fn spender_get_reads_the_packed_record() {
         other => panic!("missing spender must be NotFound, got {other:?}"),
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A crash between flushes reopens at the last flushed length. Bytes past it,
+/// torn or not, are ignored, and the next append takes the next id.
+#[test]
+fn a_crash_between_flushes_reopens_at_the_flushed_length() {
+    let dir = rbitcoin_store::testutil::TempDir::labeled("spent-ovf-crash").unwrap();
+    let path = dir.path().to_path_buf();
+    let committed = 300u64;
+    let kept;
+    {
+        let s = Store::create_tiny(&path).unwrap();
+        for i in 1..=committed {
+            s.spenders.append(Fk(i), i as u32, Fk::NULL).unwrap();
+        }
+        s.spenders.flush().unwrap();
+        kept = s.spenders.get(Fk(committed)).unwrap();
+        s.spenders.append(Fk(9), 1, Fk::NULL).unwrap();
+        s.spenders.append(Fk(9), 2, Fk::NULL).unwrap();
+        // The process dies here: nothing flushes on the way out.
+        std::mem::forget(s);
+    }
+    let end = SpenderTable::offset(committed + 1);
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path.join("spent.ovf"))
+            .unwrap();
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(end)).unwrap();
+        std::io::Write::write_all(&mut file, &[0xffu8; 2 * SPENDER_RECORD_LEN]).unwrap();
+        file.sync_all().unwrap();
+    }
+    let s = Store::open_tiny(&path).unwrap();
+    assert_eq!(s.spenders.count(), committed);
+    assert_eq!(s.spenders.get(Fk(committed)).unwrap(), kept);
+    assert!(matches!(
+        s.spenders.get(Fk(committed + 1)),
+        Err(StoreError::NotFound)
+    ));
+    let next = s.spenders.append(Fk(5), 5, Fk(committed)).unwrap();
+    assert_eq!(next, Fk(committed + 1));
+    assert_eq!(s.spenders.get(next).unwrap(), (Fk(5), 5, Fk(committed)));
+}
+
+/// An append writes past the durable end and arms no mark. Only a flush
+/// publishes the length, after the nodes are synced.
+#[test]
+fn an_append_arms_no_mark_and_waits_for_flush_to_publish() {
+    let dir = rbitcoin_store::testutil::TempDir::labeled("spent-ovf-append-order").unwrap();
+    let path = dir.path().to_path_buf();
+    let s = Store::create_tiny(&path).unwrap();
+    let fk = s.spenders.append(Fk(7), 1, Fk::NULL).unwrap();
+    assert_eq!(s.spenders.get(fk).unwrap(), (Fk(7), 1, Fk::NULL));
+    assert!(
+        !path.join("guard/spent.ovf").exists(),
+        "an append arms no mark"
+    );
+    assert_eq!(
+        SpenderTable::open(&path).unwrap().count(),
+        0,
+        "the durable length waits for a flush"
+    );
+    s.spenders.flush().unwrap();
+    let reopened = SpenderTable::open(&path).unwrap();
+    assert_eq!(reopened.count(), 1);
+    assert_eq!(reopened.get(fk).unwrap(), (Fk(7), 1, Fk::NULL));
+}
+
+/// A flush whose node sync fails publishes no length, and the latch keeps
+/// a retry from publishing one.
+#[cfg(debug_assertions)]
+#[test]
+fn a_failed_node_sync_publishes_no_length() {
+    let dir = rbitcoin_store::testutil::TempDir::labeled("spent-ovf-sync-first").unwrap();
+    let path = dir.path().to_path_buf();
+    let s = Store::create_tiny(&path).unwrap();
+    s.spenders.append(Fk(7), 1, Fk::NULL).unwrap();
+    rbitcoin_store::io_handle::arm_fail_sync(s.spenders.body.io_handle(), 1);
+    assert!(s.spenders.flush().is_err());
+    assert!(s.spenders.flush().is_err(), "the latch holds");
+    assert_eq!(SpenderTable::open(&path).unwrap().count(), 0);
+}
+
+/// An append that lands after the node sync and before the length write is
+/// not in that sync. The flush publishes only the length it synced; the
+/// later node waits for the next flush.
+#[cfg(debug_assertions)]
+#[test]
+fn an_append_during_a_flush_stays_out_of_its_length() {
+    let dir = rbitcoin_store::testutil::TempDir::labeled("spent-ovf-race").unwrap();
+    let path = dir.path().to_path_buf();
+    let s = Store::create_tiny(&path).unwrap();
+    s.spenders.append(Fk(7), 1, Fk::NULL).unwrap();
+    rbitcoin_store::spender_table::set_after_node_sync(Some(Box::new(|t: &SpenderTable| {
+        t.append(Fk(8), 1, Fk::NULL).unwrap();
+    })));
+    s.spenders.flush().unwrap();
+    assert_eq!(s.spenders.count(), 2);
+    let header_len = |p: &std::path::Path| {
+        let raw = std::fs::read(p.join("spent.ovf")).unwrap();
+        u64::from_le_bytes(raw[8..16].try_into().unwrap())
+    };
+    assert_eq!(
+        header_len(&path),
+        SpenderTable::offset(2),
+        "the flush published a node its sync did not cover"
+    );
+    s.spenders.flush().unwrap();
+    assert_eq!(header_len(&path), SpenderTable::offset(3));
+}
+
+/// The length sync is the last step of a flush. When it fails, the flush
+/// errs and the latch refuses the next one.
+#[cfg(debug_assertions)]
+#[test]
+fn a_failed_length_sync_latches_the_flush() {
+    let dir = rbitcoin_store::testutil::TempDir::labeled("spent-ovf-len-sync").unwrap();
+    let path = dir.path().to_path_buf();
+    let s = Store::create_tiny(&path).unwrap();
+    s.spenders.append(Fk(7), 1, Fk::NULL).unwrap();
+    // The node sync passes; the length sync after it fails.
+    rbitcoin_store::io_handle::arm_fail_sync_after(s.spenders.body.io_handle(), 1, 1);
+    assert!(s.spenders.flush().is_err());
+    assert!(s.spenders.flush().is_err(), "the latch holds");
+}
+
+/// Flushes do not overlap. A second flush started while the first sits
+/// between its node sync and its length write waits for the first to end,
+/// so it cannot pass the latch check before the first latches a failed sync
+/// and then publish a length over nodes the kernel dropped.
+#[cfg(debug_assertions)]
+#[test]
+fn a_flush_waits_for_a_flush_in_progress() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::channel;
+    use std::sync::Arc;
+    use std::time::Duration;
+    let dir = rbitcoin_store::testutil::TempDir::labeled("spent-ovf-serial").unwrap();
+    let path = dir.path().to_path_buf();
+    let s = Store::create_tiny(&path).unwrap();
+    s.spenders.append(Fk(7), 1, Fk::NULL).unwrap();
+    let (go_tx, go_rx) = channel::<()>();
+    let (done_tx, done_rx) = channel::<()>();
+    let overlapped = Arc::new(AtomicBool::new(false));
+    let seen = Arc::clone(&overlapped);
+    rbitcoin_store::spender_table::set_after_node_sync(Some(Box::new(move |_t: &SpenderTable| {
+        go_tx.send(()).unwrap();
+        if done_rx.recv_timeout(Duration::from_millis(300)).is_ok() {
+            seen.store(true, Ordering::SeqCst);
+        }
+    })));
+    std::thread::scope(|scope| {
+        let spenders = &s.spenders;
+        let second = scope.spawn(move || {
+            go_rx.recv().unwrap();
+            let flushed = spenders.flush();
+            let _ = done_tx.send(());
+            flushed
+        });
+        s.spenders.flush().unwrap();
+        second.join().unwrap().unwrap();
+    });
+    assert!(
+        !overlapped.load(Ordering::SeqCst),
+        "a second flush ran inside the first"
+    );
 }

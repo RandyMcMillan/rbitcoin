@@ -16,6 +16,7 @@ Open the row that matches the change. Leave the other owners closed.
 | Which head file | [`docs/heads.md`](../../docs/heads.md) |
 | fd vs io_uring | [`docs/io-modality.md`](../../docs/io-modality.md) |
 | Tip-as-commit, kill-9 | [`docs/crash-recovery.md`](../../docs/crash-recovery.md) |
+| A write that changes committed bytes | [`docs/crash-recovery.md`](../../docs/crash-recovery.md#two-doors) |
 
 ## Where
 

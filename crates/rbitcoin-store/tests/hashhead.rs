@@ -3,7 +3,32 @@ use rbitcoin_store::error::StoreError;
 use rbitcoin_store::hashhead::*;
 
 fn tmp_path() -> std::path::PathBuf {
-    rbitcoin_store::testutil::fresh_path("hh")
+    let dir = rbitcoin_store::testutil::fresh_path("hh");
+    std::fs::create_dir_all(&dir).unwrap();
+    dir.join("header.head")
+}
+
+/// A new head, its `.mlt`, and their directory are synced before create
+/// returns. Each header is two pwrites, unordered without a sync, and the
+/// first insert's mark images only the pages it fills: page 0 of an empty
+/// head is not one of them. A restore recreates a lost name from the images.
+#[cfg(debug_assertions)]
+#[test]
+fn create_syncs_the_head_and_multi_list_before_any_mark() {
+    let path = tmp_path();
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    let h = HashHead::create_with_slots(&path, DEFAULT_SLOTS).unwrap();
+    let synced = rbitcoin_store::file::take_fsynced_dirs();
+    let mlt = MultiList::path_for(&path);
+    let dir = path.parent().unwrap().to_path_buf();
+    for want in [&path, &mlt, &dir] {
+        assert!(
+            synced.iter().any(|p| p == want),
+            "{} was not synced at create: {synced:?}",
+            want.display()
+        );
+    }
+    drop(h);
 }
 
 #[test]
@@ -134,11 +159,10 @@ fn torn_chunk_restores_from_ahead_image() {
             "key {i} lost after a torn chunk"
         );
     }
-    let mut side = path.as_os_str().to_os_string();
-    side.push(".ahead");
+    let mark = path.parent().unwrap().join("guard/header.head");
     assert!(
-        !std::path::PathBuf::from(side).exists(),
-        "open must remove the applied ahead image"
+        !mark.exists(),
+        "open must remove the applied header.head mark"
     );
     cleanup_hh(&path);
 }
@@ -174,6 +198,81 @@ fn leftover_ahead_pages_survive_a_later_write() {
         Some(Fk(1)),
         "the committed key on the first page was lost"
     );
+    cleanup_hh(&path);
+}
+
+/// `.mlt` only appends. Its rows and length are durable before the head mark
+/// arms, so the mark images `header.head` alone.
+#[test]
+fn an_mlt_append_is_durable_before_a_head_mark_that_names_only_the_head() {
+    let path = tmp_path();
+    let mut k1 = [0u8; 32];
+    k1[0] = 0xab;
+    k1[15] = 1;
+    k1[16] = 1;
+    let mut k2 = k1;
+    k2[16] = 2;
+    {
+        let h = HashHead::create_with_slots(&path, DEFAULT_SLOTS).unwrap();
+        h.insert(&k1, Fk(10)).unwrap();
+        h.flush().unwrap();
+        fail_next_hash_head_flush_after_ahead(&path);
+        assert!(
+            h.insert(&k2, Fk(20)).is_err(),
+            "the failpoint must stop before the head write"
+        );
+    }
+    let mark = std::fs::read(path.parent().unwrap().join("guard/header.head")).unwrap();
+    assert!(
+        !mark.windows(4).any(|w| w == b".mlt"),
+        "the head mark must not image header.head.mlt"
+    );
+    assert_eq!(
+        *MultiList::open(&path).unwrap().count.lock().unwrap(),
+        2,
+        "the .mlt rows must be published before the head mark arms"
+    );
+    zero_ahead_blocks(&path, &[k1, k2], DEFAULT_SLOTS);
+    let h = HashHead::open(&path).unwrap();
+    let all = h.get_all(&k1).unwrap();
+    assert!(
+        all.contains(&Fk(10)) && all.contains(&Fk(20)),
+        "the head mark and the durable .mlt must give both values, got {all:?}"
+    );
+    cleanup_hh(&path);
+}
+
+/// A head flush whose `.mlt` length flush fails may have made that length
+/// durable. The `.mlt` refuses later inserts until reopen, which reads the
+/// rows the durable length names.
+#[cfg(debug_assertions)]
+#[test]
+fn a_failed_mlt_length_flush_refuses_inserts_until_reopen() {
+    let path = tmp_path();
+    let mut k1 = [0u8; 32];
+    k1[0] = 0xab;
+    k1[15] = 1;
+    k1[16] = 1;
+    let mut k2 = k1;
+    k2[16] = 2;
+    let mut k3 = k1;
+    k3[16] = 3;
+    {
+        let h = HashHead::create_with_slots(&path, DEFAULT_SLOTS).unwrap();
+        h.insert(&k1, Fk(10)).unwrap();
+        h.flush().unwrap();
+        rbitcoin_store::io_handle::arm_fail_flush(h.multi.file.io_handle(), 1);
+        assert!(h.insert(&k2, Fk(20)).is_err());
+        assert!(
+            h.insert(&k3, Fk(30)).is_err(),
+            "an insert after a failed .mlt flush was accepted"
+        );
+    }
+    let h = HashHead::open(&path).unwrap();
+    assert!(h.get_all(&k1).unwrap().contains(&Fk(10)));
+    h.insert(&k3, Fk(30)).expect("an insert after reopen");
+    h.flush().unwrap();
+    assert!(h.get_all(&k1).unwrap().contains(&Fk(30)));
     cleanup_hh(&path);
 }
 
@@ -300,6 +399,13 @@ fn slot_sorted_batch_matches_sequential_inserts() {
 }
 
 fn cleanup_hh(path: &std::path::Path) {
+    if let Some(dir) = path.parent() {
+        let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.starts_with("rbitcoin-hh-") {
+            let _ = std::fs::remove_dir_all(dir);
+            return;
+        }
+    }
     let _ = std::fs::remove_file(path);
     let mut mlt = path.as_os_str().to_os_string();
     mlt.push(".mlt");
@@ -504,5 +610,46 @@ fn hashhead_one_key_roundtrip() {
     h.insert_many(&[(key, Fk(77)), (key, Fk(78))]).unwrap();
     assert_eq!(h.get_all(&key).unwrap(), vec![Fk(78), Fk(77)]);
     assert_eq!(h.occupied(), 1);
+    cleanup_hh(&path);
+}
+
+/// A bare file name has no directory for `guard/header.head`. Open refuses
+/// it, as the arm and the clear do, instead of skipping the restore.
+#[test]
+fn open_refuses_a_bare_file_name() {
+    match HashHead::open("hashhead-bare-name") {
+        Err(StoreError::Rejected(_)) => {}
+        Err(e) => panic!("bare name opened past the guard: {e:?}"),
+        Ok(_) => panic!("bare name opened"),
+    }
+}
+
+/// The first insert into an empty head writes and images only the pages its
+/// keys land in. An empty table is all zeros on disk, so writing the whole
+/// table would cost a mark the size of the table at mainnet scale.
+#[cfg(debug_assertions)]
+#[test]
+fn a_first_insert_writes_only_the_pages_it_fills() {
+    let path = tmp_path();
+    let h = HashHead::create_with_slots(&path, 1 << 16).unwrap();
+    let mut key = [0u8; 32];
+    key[0] = 0x5c;
+    rbitcoin_store::file::arm_write_trace();
+    h.insert(&key, Fk(7)).unwrap();
+    let written: u64 = rbitcoin_store::file::take_write_trace()
+        .into_iter()
+        .filter_map(|w| match w {
+            rbitcoin_store::file::TracedWrite::Write { path: p, len, .. } if p == path => Some(len),
+            _ => None,
+        })
+        .sum();
+    assert!(
+        written <= 2 * 4096,
+        "the first insert wrote {written} bytes"
+    );
+    assert_eq!(h.get_all(&key).unwrap(), vec![Fk(7)]);
+    drop(h);
+    let h = HashHead::open(&path).unwrap();
+    assert_eq!(h.get_all(&key).unwrap(), vec![Fk(7)]);
     cleanup_hh(&path);
 }

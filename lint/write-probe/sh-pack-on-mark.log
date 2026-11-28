@@ -1,0 +1,3 @@
+PROBE LEN_ON_MARK scripthash.body/ rbitcoin_store::scripthash_materialize::pack_and_seal_unsorted_shard#44431f02e38aab78 end=4096 off=8 len=8
+    rbitcoin_store::scripthash_materialize::materialize_sh_from_unsorted_from_txs
+    rbitcoin_store::scripthash_materialize::materialize_sh_unsorted_from_class_a

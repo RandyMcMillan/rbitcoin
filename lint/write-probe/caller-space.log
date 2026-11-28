@@ -1,0 +1,4 @@
+PROBE MULTI_SECTOR store/blockfilter.body rbitcoin_store::block_filter::Pair<A, B>::write#00000000000000aa end=9000 off=600 len=1024
+    rbitcoin_store::block_filter::repair_body
+PROBE MULTI_SECTOR store/blockfilter.body rbitcoin_store::block_filter::Pair<A, B>::write#00000000000000bb end=9000 off=600 len=1024
+    rbitcoin_store::block_filter::BlockFilter::append

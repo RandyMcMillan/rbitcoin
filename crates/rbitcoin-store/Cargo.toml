@@ -24,6 +24,9 @@ getrandom = "0.4"
 
 [features]
 mutants = []
+# CI only: log every in-place write and length publish to `$WRITE_PROBE_OUT`
+# for `scripts/write-probe-classify.py`. See docs/crash-recovery.md.
+write-probe = []
 
 [dev-dependencies]
 bitcoin_hashes = { workspace = true }

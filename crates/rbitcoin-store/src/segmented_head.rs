@@ -6,7 +6,7 @@
 //!   tx.head/
 //!     meta                       # segment descriptors
 //!     000000                     # shutdown snapshot of the open tail (absent while live)
-//!     000000.mphf + .fuse8     # sealed: value-assigned MPHF + fuse8
+//!     000000.mphf + .fuse8 + .mlt  # sealed: value-assigned MPHF, fuse8, multi-list
 //!     …
 //! ```
 //!
@@ -43,6 +43,10 @@ const SEG_DESC_LEN: usize = 32;
 const FLAG_SEALED: u32 = 1;
 /// Every slot of this unsealed OA carries its key's fingerprint.
 const FLAG_TAGGED: u32 = 2;
+/// Seal wrote `NNNNNN.mlt`. A sealed segment with this bit and no file, or a
+/// short file, is corrupt. A segment without the bit still treats a missing
+/// file as an empty map. Meta stays v2.
+const FLAG_MLT: u32 = 4;
 
 /// Collect `(fuse_key, rel)` for a sealed range (`first_fk`, `count`).
 ///
@@ -62,6 +66,8 @@ pub struct Segment {
     /// Unsealed OA whose slots all carry fingerprints (false only for a
     /// meta v1 head until `TxTable` writes them).
     pub tagged: AtomicBool,
+    /// `FLAG_MLT` was persisted for this segment. Set only after `write_mlt`.
+    pub mlt_present: bool,
     pub head: Option<Arc<AddressHead>>,
     /// Snapshot footer generation loaded for this unsealed segment, and only
     /// when it matched `count` at open. `None` when the slots started empty.
@@ -140,6 +146,7 @@ impl SegmentedTxHead {
             let path = segment_head_path(&dir, d.file_id);
             let sealed = d.flags & FLAG_SEALED != 0;
             let tagged = sealed || d.flags & FLAG_TAGGED != 0;
+            let mlt_present = d.flags & FLAG_MLT != 0;
             let (head, pack) = if sealed {
                 if !TxHeadMphf::exists(&path) {
                     return Err(StoreError::Corrupt("tx.head sealed segment missing mphf"));
@@ -152,7 +159,12 @@ impl SegmentedTxHead {
                     );
                     let _ = std::fs::remove_file(&path);
                 }
-                (None, Some(Arc::new(TxHeadMphf::open(&path)?)))
+                let mphf = if mlt_present {
+                    TxHeadMphf::open_requiring_mlt(&path)?
+                } else {
+                    TxHeadMphf::open(&path)?
+                };
+                (None, Some(Arc::new(mphf)))
             } else {
                 // The tail is loaded below. An unsealed non-tail is loaded
                 // only when a snapshot's generation matches its count (a
@@ -176,6 +188,7 @@ impl SegmentedTxHead {
                 file_id: d.file_id,
                 sealed,
                 tagged: AtomicBool::new(tagged),
+                mlt_present,
                 head,
                 loaded_generation: None,
                 pack,
@@ -195,6 +208,7 @@ impl SegmentedTxHead {
                     file_id: last.file_id,
                     sealed: false,
                     tagged: AtomicBool::new(last.tagged.load(Ordering::Relaxed)),
+                    mlt_present: last.mlt_present,
                     head: Some(Arc::new(table)),
                     loaded_generation,
                     pack: None,
@@ -224,6 +238,7 @@ impl SegmentedTxHead {
                 file_id,
                 sealed: false,
                 tagged: AtomicBool::new(tagged),
+                mlt_present: seg.mlt_present,
                 head: Some(Arc::new(table)),
                 loaded_generation,
                 pack: None,
@@ -925,6 +940,7 @@ impl SegmentedTxHead {
             file_id,
             sealed: false,
             tagged: AtomicBool::new(true),
+            mlt_present: false,
             head: Some(Arc::new(head)),
             loaded_generation: None,
             pack: None,
@@ -1015,6 +1031,7 @@ impl SegmentedTxHead {
                 file_id,
                 sealed: true,
                 tagged: AtomicBool::new(true),
+                mlt_present: true,
                 head: None,
                 loaded_generation: None,
                 pack: Some(Arc::new(p.pack)),
@@ -1171,6 +1188,7 @@ impl SegmentedTxHead {
                 file_id: p.file_id,
                 sealed: true,
                 tagged: AtomicBool::new(true),
+                mlt_present: true,
                 head: None,
                 loaded_generation: None,
                 pack: Some(Arc::new(p.pack)),
@@ -1221,6 +1239,7 @@ impl SegmentedTxHead {
                     file_id: last.file_id,
                     sealed: false,
                     tagged: AtomicBool::new(last.tagged.load(Ordering::Relaxed)),
+                    mlt_present: last.mlt_present,
                     head: Some(Arc::new(AddressHead::empty(self.layout))),
                     loaded_generation: None,
                     pack: None,
@@ -1249,6 +1268,9 @@ impl SegmentedTxHead {
                 let mut flags = if s.sealed { FLAG_SEALED } else { 0 };
                 if s.tagged.load(Ordering::Relaxed) {
                     flags |= FLAG_TAGGED;
+                }
+                if s.mlt_present {
+                    flags |= FLAG_MLT;
                 }
                 (
                     s.first_fk,

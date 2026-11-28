@@ -10,13 +10,13 @@
 //! In-RAM gets take no reader-writer lock.
 //! Counter order is the Class C paragraph of `docs/concurrency.md`.
 
-use crate::durability::Durable as _;
 use crate::error::StoreError;
 use crate::file::{self, TableFile, FILE_HEADER_LEN};
+use crate::page_guard::{self, PAGE};
 use crate::sync::atomic::{self, AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
-use bitcoin_hashes::{sha256, Hash, HashEngine};
 use rbitcoin_primitives::{le_u64, TableKind};
 use std::cell::Cell;
+use std::collections::BTreeSet;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 #[cfg(debug_assertions)]
@@ -104,7 +104,8 @@ impl TipFlushHold {
         }
     }
 
-    fn wait_while_set(&self) {
+    #[doc(hidden)]
+    pub fn wait_while_set(&self) {
         let mut guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         if self.flag.load(Ordering::Acquire) {
             self.entered.store(true, Ordering::Release);
@@ -153,22 +154,6 @@ pub const ELEM: u64 = 8;
 pub const FLUSH_SCRATCH: usize = 4096;
 
 const CLEAN: u64 = u64::MAX;
-
-/// Write-ahead image of the dirty range, used by the Class C range tables.
-///
-/// A flush can rewrite the 4 KiB block that holds the previous tip's committed
-/// entries. The `*.ahead` file holds the intended post-write header and image,
-/// synced before the payload, so open can put them back after a tear.
-const AHEAD_MAGIC: &[u8; 4] = b"ATA1";
-const AHEAD_VERSION: u16 = 1;
-const AHEAD_HEAD: usize = 28;
-const AHEAD_REC: usize = 8 + 4 + 32;
-const AHEAD_MAX_BYTES: u64 = 64 << 20;
-
-struct AheadImage {
-    header: Vec<u8>,
-    records: Vec<(u64, Vec<u8>)>,
-}
 
 /// Where a flush calls its test hook.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -222,6 +207,29 @@ pub fn class_c_inram_max_bytes() -> u64 {
     TEST_CLASS_C_INRAM_MAX
         .with(Cell::get)
         .unwrap_or(DEFAULT_CLASS_C_INRAM_MAX_BYTES)
+}
+
+fn overlay_bytes(image: &mut [u8; PAGE as usize], page: u64, off: u64, bytes: &[u8]) {
+    let end = off.saturating_add(bytes.len() as u64);
+    let lo = off.max(page);
+    let hi = end.min(page + PAGE);
+    if lo >= hi {
+        return;
+    }
+    let src = (lo - off) as usize;
+    let dst = (lo - page) as usize;
+    let n = (hi - lo) as usize;
+    image[dst..dst + n].copy_from_slice(&bytes[src..src + n]);
+}
+
+fn overlay_range(image: &mut [u8; PAGE as usize], page: u64, lo: u64, hi: u64, byte: u8) {
+    let a = lo.max(page);
+    let b = hi.min(page + PAGE);
+    if a >= b {
+        return;
+    }
+    let dst = (a - page) as usize;
+    image[dst..dst + (b - a) as usize].fill(byte);
 }
 
 /// Copy `dst.len()` bytes from packed words at byte `start`.
@@ -618,6 +626,22 @@ pub(crate) fn seq_arm(seq: &AtomicU64, flushing: &AtomicBool) {
     }
 }
 
+/// Whole 4 KiB images keyed by file offset.
+pub(crate) type PageImages = Vec<(u64, [u8; PAGE as usize])>;
+
+/// What one grouped flush imaged: the first element it writes, the length it
+/// writes, the dirty generation sampled with the images, and the images.
+///
+/// Holds the table's flush lock, so no other flush runs between the images
+/// and their write.
+pub(crate) struct GuardSpan<'a> {
+    start: u64,
+    n: u64,
+    gen: u64,
+    pub(crate) pages: PageImages,
+    _one: std::sync::MutexGuard<'a, ()>,
+}
+
 /// On success, disk length and the clean mark publish before `flushing` clears.
 /// Fields are the flag, the disk length, the unstored mark, and the persisted length.
 #[must_use]
@@ -645,6 +669,8 @@ pub(crate) fn seq_read<T>(seq: &AtomicU64, mut sample: impl FnMut() -> Option<T>
     loop {
         let g1 = seq.load(Ordering::Acquire);
         if g1 & 1 != 0 {
+            #[cfg(debug_assertions)]
+            odd_read::note(seq);
             crate::sync::spin();
             continue;
         }
@@ -655,6 +681,32 @@ pub(crate) fn seq_read<T>(seq: &AtomicU64, mut sample: impl FnMut() -> Option<T>
         } else if seq_holds(seq, g1) {
             crate::sync::spin();
         }
+    }
+}
+
+/// Test signal: a [`seq_read`] on one watched counter saw an odd generation.
+#[cfg(debug_assertions)]
+pub(crate) mod odd_read {
+    use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+
+    static WATCHED: AtomicPtr<super::AtomicU64> = AtomicPtr::new(std::ptr::null_mut());
+    static SEEN: AtomicBool = AtomicBool::new(false);
+
+    /// Watch `seq` from now on, with nothing seen yet.
+    pub(crate) fn watch(seq: &super::AtomicU64) {
+        SEEN.store(false, Ordering::SeqCst);
+        WATCHED.store(std::ptr::from_ref(seq).cast_mut(), Ordering::SeqCst);
+    }
+
+    pub(super) fn note(seq: &super::AtomicU64) {
+        if std::ptr::eq(WATCHED.load(Ordering::SeqCst), seq) {
+            SEEN.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// True once a read of the watched counter saw it odd.
+    pub(crate) fn seen() -> bool {
+        SEEN.load(Ordering::SeqCst)
     }
 }
 
@@ -671,12 +723,19 @@ pub struct ArrayTable {
     pub(crate) seq: AtomicU64,
     /// Lowest index not yet persisted. `u64::MAX` means none.
     pub unstored_from: AtomicU64,
+    /// Bumps on every dirty note. A flush publishes clean only when this is
+    /// still the value captured under `flushing`.
+    unstored_gen: AtomicU64,
     /// True from the moment a flush records its range until it returns.
     pub flushing: AtomicBool,
     /// Length last flushed. Elements, or body bytes when `byte_body` is set.
     pub disk_len: AtomicU64,
     /// One flusher at a time.
     pub flush_lock: Mutex<()>,
+    /// An fd write failed after it armed `store/guard/class_c`. Its mark may
+    /// still be on the device even when the file is gone, so writes,
+    /// truncates, flushes, and pair reads refuse until reopen restores it.
+    class_c_failed: AtomicBool,
     /// Largest chunk the last flush passed to `write_at`. Debug builds only.
     #[cfg(debug_assertions)]
     #[doc(hidden)]
@@ -736,9 +795,11 @@ impl ArrayTable {
             slots: data.map_or_else(RamSlots::empty, RamSlots::from_values),
             seq: AtomicU64::new(0),
             unstored_from: AtomicU64::new(CLEAN),
+            unstored_gen: AtomicU64::new(0),
             flushing: AtomicBool::new(false),
             disk_len: AtomicU64::new(n),
             flush_lock: Mutex::new(()),
+            class_c_failed: AtomicBool::new(false),
             #[cfg(debug_assertions)]
             flush_chunk_max: AtomicUsize::new(0),
         }
@@ -765,7 +826,16 @@ impl ArrayTable {
     }
 
     fn mark_unstored(&self, index: u64) {
-        let _ = self.unstored_from.fetch_min(index, Ordering::AcqRel);
+        self.note_unstored(index);
+    }
+
+    /// The generation moves first, then the index. A flush that already sampled
+    /// the old generation cannot publish clean over this note.
+    pub(crate) fn note_unstored(&self, index: u64) {
+        // SeqCst with `publish_clean`: its second generation load must see
+        // this increment whenever its CLEAN store can overwrite the index.
+        self.unstored_gen.fetch_add(1, Ordering::SeqCst);
+        let _ = self.unstored_from.fetch_min(index, Ordering::SeqCst);
     }
 
     pub fn get(&self, index: u64) -> Result<u64, StoreError> {
@@ -944,6 +1014,129 @@ impl ArrayTable {
         max_idx: u64,
         zero_gap: bool,
     ) -> Result<(), StoreError> {
+        let _hold = page_guard::hold_marks();
+        self.refuse_armed_class_c()?;
+        let pages = self.fd_guard_pages(pairs, max_idx, zero_gap)?;
+        let armed = (|| {
+            let mark = self.arm_class_c(&pages)?;
+            self.write_fd_live(pairs, max_idx, zero_gap)?;
+            if let Some(mark) = mark {
+                page_guard::clear_page_guard(&mark, &self.file.read_file, self.file.path())?;
+            }
+            Ok(())
+        })();
+        if armed.is_err() {
+            self.class_c_failed.store(true, Ordering::Release);
+        }
+        armed
+    }
+
+    /// Both columns of an fd-only pair under one `store/guard/class_c` mark.
+    ///
+    /// Both columns' pages are imaged before either is written, so open
+    /// reads the old pair or the new pair, never one column of each.
+    pub(crate) fn write_fd_pair(
+        a: &ArrayTable,
+        a_pairs: &[(u64, u64)],
+        b: &ArrayTable,
+        b_pairs: &[(u64, u64)],
+        zero_gap: bool,
+    ) -> Result<(), StoreError> {
+        let max_of = |pairs: &[(u64, u64)]| pairs.iter().map(|(i, _)| *i).max();
+        let (Some(a_max), Some(b_max)) = (max_of(a_pairs), max_of(b_pairs)) else {
+            return Ok(());
+        };
+        if !zero_gap
+            && (!a.extension_is_dense(a_max, a_pairs) || !b.extension_is_dense(b_max, b_pairs))
+        {
+            return Err(StoreError::Corrupt("array set skips slots"));
+        }
+        let _a_odd = a.begin_store()?;
+        let _b_odd = b.begin_store()?;
+        let _hold = page_guard::hold_marks();
+        a.refuse_armed_class_c()?;
+        b.refuse_failed_class_c()?;
+        let a_pages = a.fd_guard_pages(a_pairs, a_max, zero_gap)?;
+        let b_pages = b.fd_guard_pages(b_pairs, b_max, zero_gap)?;
+        let dir = a.store_dir()?;
+        let (a_name, b_name) = (a.guard_name()?, b.guard_name()?);
+        let refs: Vec<(&str, u64, &[u8])> = a_pages
+            .iter()
+            .map(|(off, image)| (a_name, *off, image.as_slice()))
+            .chain(
+                b_pages
+                    .iter()
+                    .map(|(off, image)| (b_name, *off, image.as_slice())),
+            )
+            .collect();
+        let armed = (|| {
+            if !refs.is_empty() {
+                page_guard::arm_store_group(dir, page_guard::CLASS_C_MARK, &refs)?;
+            }
+            a.write_fd_live(a_pairs, a_max, zero_gap)?;
+            b.write_fd_live(b_pairs, b_max, zero_gap)?;
+            if !refs.is_empty() {
+                page_guard::clear_page_guard_files(
+                    &dir.join(page_guard::CLASS_C_MARK),
+                    &[
+                        (&a.file.read_file, a.file.path()),
+                        (&b.file.read_file, b.file.path()),
+                    ],
+                )?;
+            }
+            Ok(())
+        })();
+        if armed.is_err() {
+            a.class_c_failed.store(true, Ordering::Release);
+            b.class_c_failed.store(true, Ordering::Release);
+        }
+        armed
+    }
+
+    pub(crate) fn is_fd_only(&self) -> bool {
+        !self.in_ram
+    }
+
+    /// A failed fd write leaves its mark. A later write would arm its own
+    /// pages and then clear the file, dropping images it never rewrote.
+    /// Refuse until reopen restores that mark.
+    fn refuse_armed_class_c(&self) -> Result<(), StoreError> {
+        self.refuse_failed_class_c()?;
+        let mark = self.store_dir()?.join(page_guard::CLASS_C_MARK);
+        if mark.try_exists().map_err(|e| StoreError::io(&mark, e))? {
+            return Err(StoreError::Rejected(
+                "an earlier Class C write is still armed; reopen restores it",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Refuse after this table's own fd write failed under a mark. A failed
+    /// `guard/` sync can unlink the mark in RAM and lose the unlink in a
+    /// crash, so the missing file does not prove the mark is gone.
+    pub(crate) fn refuse_failed_class_c(&self) -> Result<(), StoreError> {
+        if self.class_c_failed.load(Ordering::Acquire) {
+            return Err(StoreError::Rejected(
+                "an earlier Class C write failed under its mark; reopen restores it",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The live bytes of one fd write, under a mark the caller armed.
+    fn write_fd_live(
+        &self,
+        pairs: &[(u64, u64)],
+        max_idx: u64,
+        zero_gap: bool,
+    ) -> Result<(), StoreError> {
+        #[cfg(debug_assertions)]
+        if crate::chain::take_fail_fd_before_live(self.file.path()) {
+            return Err(StoreError::io(
+                self.file.path(),
+                std::io::Error::other("injected fd write failure before live bytes"),
+            ));
+        }
         let len = self.len.load(Ordering::Acquire);
         for &(index, value) in pairs {
             if index < len {
@@ -1059,6 +1252,10 @@ impl ArrayTable {
         }
         let _odd = self.begin_store()?;
         if !self.in_ram {
+            // The length is one in-sector write and needs no image. A mark a
+            // failed write left would restore its longer length over it.
+            let _hold = page_guard::hold_marks();
+            self.refuse_armed_class_c()?;
             self.len.store(new_len, Ordering::Release);
             let logical = FILE_HEADER_LEN as u64 + new_len * ELEM;
             self.file.set_logical_len(logical)?;
@@ -1100,342 +1297,222 @@ impl ArrayTable {
         self.slots.slots(Ordering::Acquire)[index as usize].store(value, Ordering::Relaxed);
     }
 
-    /// Sidecar path for [`Self::write_ahead`].
-    pub(crate) fn ahead_path(path: &Path) -> PathBuf {
-        let mut name = path
-            .file_name()
-            .unwrap_or_else(|| std::ffi::OsStr::new("array"))
-            .to_os_string();
-        name.push(".ahead");
-        match path.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
-            _ => PathBuf::from(name),
-        }
-    }
-
-    /// Put a synced write-ahead image back, if one is left.
+    /// Every 4 KiB block this flush rewrites, plus page 0, and the span
+    /// [`Self::persist_dirty`] writes.
     ///
-    /// The image is the intended post-write header and payload, not the old
-    /// bytes. It is safe to apply twice: a crash after the payload, before the
-    /// sidecar is removed, restores the same state.
-    /// Apply the image but leave the sidecar, so a pair can remove both only
-    /// after both restores succeed.
-    pub(crate) fn restore_ahead_keep(path: &Path) -> Result<(), StoreError> {
-        Self::restore_ahead_inner(path, false)
-    }
-
-    /// Test-only entry to the private restore path.
-    #[cfg(debug_assertions)]
-    #[doc(hidden)]
-    pub fn restore_ahead_for_test(path: &Path, remove: bool) -> Result<(), StoreError> {
-        Self::restore_ahead_inner(path, remove)
-    }
-
-    /// Pair stamp in the reserved header slot. `0` is an unstamped image.
-    pub(crate) fn ahead_pair_gen(raw: &[u8]) -> Result<u16, StoreError> {
-        if raw.len() < 8 || raw[0..4] != *AHEAD_MAGIC {
-            return Err(StoreError::Corrupt("array ahead header"));
-        }
-        if u16::from_le_bytes([raw[4], raw[5]]) != AHEAD_VERSION {
-            return Err(StoreError::Corrupt("array ahead version"));
-        }
-        Ok(u16::from_le_bytes([raw[6], raw[7]]))
-    }
-
-    fn parse_ahead(raw: &[u8]) -> Result<AheadImage, StoreError> {
-        if raw.len() < AHEAD_HEAD || raw[0..4] != *AHEAD_MAGIC {
-            return Err(StoreError::Corrupt("array ahead header"));
-        }
-        if u16::from_le_bytes([raw[4], raw[5]]) != AHEAD_VERSION {
-            return Err(StoreError::Corrupt("array ahead version"));
-        }
-        let count = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]) as usize;
-        if count > (raw.len().saturating_sub(AHEAD_HEAD)) / AHEAD_REC {
-            return Err(StoreError::Corrupt("array ahead count"));
-        }
-        let header = raw[12..28].to_vec();
-        let logical = u64::from_le_bytes([
-            header[8], header[9], header[10], header[11], header[12], header[13], header[14],
-            header[15],
-        ]);
-        // Zero records is a header-only image, valid only for a shrink to an
-        // empty table.
-        if count == 0 && logical != FILE_HEADER_LEN as u64 {
-            return Err(StoreError::Corrupt("array ahead count"));
-        }
-        let mut at = AHEAD_HEAD;
-        let mut images = Vec::with_capacity(count);
-        for _ in 0..count {
-            if raw.len() < at + AHEAD_REC {
-                return Err(StoreError::Corrupt("array ahead short"));
-            }
-            let off = u64::from_le_bytes([
-                raw[at],
-                raw[at + 1],
-                raw[at + 2],
-                raw[at + 3],
-                raw[at + 4],
-                raw[at + 5],
-                raw[at + 6],
-                raw[at + 7],
-            ]);
-            let len =
-                u32::from_le_bytes([raw[at + 8], raw[at + 9], raw[at + 10], raw[at + 11]]) as usize;
-            let sum = &raw[at + 12..at + 44];
-            let image_at = at + AHEAD_REC;
-            let image = raw
-                .get(image_at..image_at + len)
-                .ok_or(StoreError::Corrupt("array ahead image"))?;
-            if off < FILE_HEADER_LEN as u64
-                || (len as u64) > AHEAD_MAX_BYTES
-                || off.checked_add(len as u64).is_none_or(|end| end > logical)
-            {
-                return Err(StoreError::Corrupt("array ahead geometry"));
-            }
-            let mut eng = sha256::HashEngine::default();
-            eng.input(&raw[at..at + 12]);
-            eng.input(image);
-            if sha256::Hash::from_engine(eng).to_byte_array() != *sum {
-                return Err(StoreError::Corrupt("array ahead checksum"));
-            }
-            images.push((off, image.to_vec()));
-            at = image_at + len;
-        }
-        if at != raw.len() {
-            return Err(StoreError::Corrupt("array ahead length"));
-        }
-        Ok(AheadImage {
-            header,
-            records: images,
-        })
-    }
-
-    fn load_ahead_records(path: &Path) -> Result<Vec<(u64, Vec<u8>)>, StoreError> {
-        let side = Self::ahead_path(path);
-        match std::fs::read(&side) {
-            Ok(raw) => Self::parse_ahead(&raw).map(|image| image.records),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(e) => Err(StoreError::io(&side, e)),
-        }
-    }
-
-    fn leftover_pieces(old_off: u64, old: &[u8], news: &[(u64, Vec<u8>)]) -> Vec<(u64, Vec<u8>)> {
-        let mut pieces = vec![(old_off, old.to_vec())];
-        for (new_off, new) in news {
-            let new_end = *new_off + new.len() as u64;
-            let mut next = Vec::new();
-            for (off, bytes) in pieces {
-                let end = off + bytes.len() as u64;
-                if end <= *new_off || off >= new_end {
-                    next.push((off, bytes));
-                    continue;
-                }
-                if off < *new_off {
-                    let keep = (*new_off - off) as usize;
-                    next.push((off, bytes[..keep].to_vec()));
-                }
-                if end > new_end {
-                    let skip = (new_end - off) as usize;
-                    next.push((new_end, bytes[skip..].to_vec()));
-                }
-            }
-            pieces = next;
-        }
-        pieces
-    }
-
-    fn clip_record(off: u64, mut bytes: Vec<u8>, logical: u64) -> Option<(u64, Vec<u8>)> {
-        if off < FILE_HEADER_LEN as u64 || off >= logical || bytes.is_empty() {
-            return None;
-        }
-        let end = off.saturating_add(bytes.len() as u64).min(logical);
-        if end <= off {
-            return None;
-        }
-        bytes.truncate((end - off) as usize);
-        if bytes.is_empty() || (bytes.len() as u64) > AHEAD_MAX_BYTES {
-            return None;
-        }
-        Some((off, bytes))
-    }
-
-    fn encode_ahead(header: &[u8], records: &[(u64, Vec<u8>)], pair_gen: u16) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(AHEAD_HEAD + 4096 + records.len() * AHEAD_REC);
-        buf.extend_from_slice(AHEAD_MAGIC);
-        buf.extend_from_slice(&AHEAD_VERSION.to_le_bytes());
-        buf.extend_from_slice(&pair_gen.to_le_bytes());
-        buf.extend_from_slice(&(records.len() as u32).to_le_bytes());
-        buf.extend_from_slice(header);
-        for (off, image) in records {
-            buf.extend_from_slice(&off.to_le_bytes());
-            buf.extend_from_slice(&(image.len() as u32).to_le_bytes());
-            let mut eng = sha256::HashEngine::default();
-            eng.input(&off.to_le_bytes());
-            eng.input(&(image.len() as u32).to_le_bytes());
-            eng.input(image);
-            buf.extend_from_slice(&sha256::Hash::from_engine(eng).to_byte_array());
-            buf.extend_from_slice(image);
-        }
-        buf
-    }
-
-    fn restore_ahead_inner(path: &Path, remove: bool) -> Result<(), StoreError> {
-        use std::io::{Seek, SeekFrom, Write};
-        let side = Self::ahead_path(path);
-        let raw = match std::fs::read(&side) {
-            Ok(raw) => raw,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(StoreError::io(&side, e)),
-        };
-        let AheadImage {
-            header,
-            records: images,
-        } = Self::parse_ahead(&raw)?;
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)
-            .map_err(|e| StoreError::io(path, e))?;
-        for (off, image) in images {
-            file.seek(SeekFrom::Start(off))
-                .map_err(|e| StoreError::io(path, e))?;
-            file.write_all(&image)
-                .map_err(|e| StoreError::io(path, e))?;
-        }
-        file.seek(SeekFrom::Start(0))
-            .map_err(|e| StoreError::io(path, e))?;
-        file.write_all(&header)
-            .map_err(|e| StoreError::io(path, e))?;
-        file.durable_sync_all()
-            .map_err(|e| StoreError::io(path, e))?;
-        drop(file);
-        if remove {
-            std::fs::remove_file(&side).map_err(|e| StoreError::io(&side, e))?;
-            if let Some(parent) = side.parent() {
-                file::fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Write each table's synced `*.ahead` sidecar, then sync their directory
-    /// once, so every image is durable before any payload write it guards.
-    /// Only the in-RAM Class C range tables use it; every table shares the
-    /// store directory. `pair_gen` stamps each image (`0`: unstamped).
-    pub(crate) fn write_aheads(
-        tables: &[&ArrayTable],
-        pair_gen: u16,
-    ) -> Result<Vec<PathBuf>, StoreError> {
-        let mut sides = Vec::with_capacity(tables.len());
-        for t in tables {
-            sides.extend(t.write_ahead_file(pair_gen)?);
-        }
-        if let Some(parent) = sides.first().and_then(|s| s.parent()) {
-            if !parent.as_os_str().is_empty() {
-                file::fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
-            }
-        }
-        Ok(sides)
-    }
-
-    /// Write the dirty range's intended post-write header and bytes to a
-    /// file-synced `*.ahead` sidecar. [`Self::write_aheads`] syncs the
-    /// directory.
-    fn write_ahead_file(&self, pair_gen: u16) -> Result<Option<PathBuf>, StoreError> {
-        if !self.in_ram || self.byte_body {
+    /// The span and the images are read once, while stores are excluded.
+    /// [`Self::persist_dirty`] writes these images, not the live slots, so
+    /// disk gets one state RAM held. A slot noted after this returns stays
+    /// dirty: the sampled generation keeps [`Self::publish_clean`] from
+    /// marking it clean, and the next flush writes it.
+    pub(crate) fn guard_pages(&self) -> Result<Option<GuardSpan<'_>>, StoreError> {
+        if !self.in_ram {
             return Ok(None);
         }
+        let one = self.flush_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if self.unstored_from.load(Ordering::Acquire) == CLEAN {
+            return Ok(None);
+        }
+        seq_arm(&self.seq, &self.flushing);
+        let _end = FlushGuard(&self.flushing, &self.disk_len, &self.unstored_from, None);
+        // After stores are excluded. A test hold pauses the tip flush here.
+        #[cfg(debug_assertions)]
+        flush_hold::wait();
         let from = self.unstored_from.load(Ordering::Acquire);
         if from == CLEAN {
             return Ok(None);
         }
-        // An empty table still gets an image: the flush rewrites the length in
-        // page 0, and the header-only image also supersedes a leftover one.
+        let gen = self.unstored_gen.load(Ordering::Acquire);
         let n = self.len.load(Ordering::Acquire);
         let disk = self.disk_len.load(Ordering::Acquire);
-        let start = from.min(disk);
-        let logical = FILE_HEADER_LEN as u64 + n * ELEM;
-        let payload_start = FILE_HEADER_LEN as u64 + start * ELEM;
-        let block_start = (payload_start & !(FLUSH_SCRATCH as u64 - 1)).max(FILE_HEADER_LEN as u64);
-        // A shrink to a block boundary writes no slot, but the flush still
-        // rewrites the length in page 0, so the page-0 record below stays.
-        let len = logical.saturating_sub(block_start) as usize;
-        if len as u64 > AHEAD_MAX_BYTES {
-            return Err(StoreError::Corrupt("array ahead image too large"));
-        }
-        let words = self.slots.slots(Ordering::Acquire);
-        let mut image = vec![0u8; len];
-        let first = ((block_start - FILE_HEADER_LEN as u64) / ELEM) as usize;
-        for (i, slot) in words
-            .iter()
-            .enumerate()
-            .skip(first)
-            .take((n as usize).saturating_sub(first))
-        {
-            let at = i * ELEM as usize + FILE_HEADER_LEN - block_start as usize;
-            if at + ELEM as usize <= image.len() {
-                image[at..at + ELEM as usize]
-                    .copy_from_slice(&slot.load(Ordering::Relaxed).to_le_bytes());
-            }
-        }
-        let header = file::encode_leading_header(self.file.kind, logical);
-        let mut records: Vec<(u64, Vec<u8>)> = Vec::with_capacity(2);
-        if block_start > FILE_HEADER_LEN as u64 && logical > FILE_HEADER_LEN as u64 {
-            let page_len = (logical.min(FLUSH_SCRATCH as u64) - FILE_HEADER_LEN as u64) as usize;
-            let mut page = vec![0u8; page_len];
-            let slots = page_len / ELEM as usize;
-            for (i, slot) in words.iter().enumerate().take(slots.min(n as usize)) {
-                let at = i * ELEM as usize;
-                page[at..at + ELEM as usize]
-                    .copy_from_slice(&slot.load(Ordering::Relaxed).to_le_bytes());
-            }
-            records.push((FILE_HEADER_LEN as u64, page));
-        }
-        if !image.is_empty() {
-            records.push((block_start, image));
-        }
-        // A leftover sidecar from a failed write keeps ranges this write does
-        // not replace; leftover pieces of old ranges are reinserted, new wins.
-        let mut merged = Vec::new();
-        for (off, old) in Self::load_ahead_records(self.file.path())? {
-            for (piece_off, piece) in Self::leftover_pieces(off, &old, &records) {
-                if let Some(clipped) = Self::clip_record(piece_off, piece, logical) {
-                    merged.push(clipped);
+        let stride = if self.byte_body { 1 } else { ELEM };
+        let start = if self.byte_body { from / 8 } else { from }.min(disk);
+        let logical = FILE_HEADER_LEN as u64 + n * stride;
+        let mut pages = BTreeSet::new();
+        // A dirty table always images page 0. A retry that skips it would keep
+        // a longer length from the previous attempt.
+        pages.insert(0u64);
+        if start < n {
+            let lo = FILE_HEADER_LEN as u64 + start * stride;
+            let hi = logical;
+            if hi > lo {
+                let first = (lo / PAGE) * PAGE;
+                let last = ((hi - 1) / PAGE) * PAGE;
+                let mut page = first;
+                while page <= last {
+                    pages.insert(page);
+                    page += PAGE;
                 }
             }
         }
-        merged.extend(records);
-        merged.sort_unstable_by_key(|(off, _)| *off);
-        let buf = Self::encode_ahead(&header, &merged, pair_gen);
-        let side = Self::ahead_path(self.file.path());
-        file::write_file_synced_tmp_rename(&side, &buf)?;
-        Ok(Some(side))
+        let mut images = Vec::with_capacity(pages.len());
+        for page in pages {
+            images.push((page, self.ram_page(page, logical)?));
+        }
+        Ok(Some(GuardSpan {
+            start,
+            n,
+            gen,
+            pages: images,
+            _one: one,
+        }))
     }
 
-    /// Remove sidecars a successful flush made unnecessary. One directory
-    /// sync covers every unlink. A leftover sidecar is harmless: open
-    /// restores the same image and removes it.
-    pub(crate) fn remove_ahead(sides: impl IntoIterator<Item = PathBuf>) -> Result<(), StoreError> {
-        let mut parent: Option<PathBuf> = None;
-        for side in sides {
-            match std::fs::remove_file(&side) {
-                Ok(()) => {
-                    if parent.is_none() {
-                        parent = side.parent().map(|p| p.to_path_buf());
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(StoreError::io(&side, e)),
+    fn ram_page(&self, page: u64, logical: u64) -> Result<[u8; PAGE as usize], StoreError> {
+        let mut image = [0u8; PAGE as usize];
+        if page == 0 {
+            image[..FILE_HEADER_LEN]
+                .copy_from_slice(&file::encode_leading_header(self.file.kind, logical));
+        }
+        let lo = page.max(FILE_HEADER_LEN as u64);
+        let hi = (page + PAGE).min(logical);
+        if lo >= hi {
+            return Ok(image);
+        }
+        let words = self.slots.slots(Ordering::Acquire);
+        let payload_lo = (lo - FILE_HEADER_LEN as u64) as usize;
+        let payload_hi = (hi - FILE_HEADER_LEN as u64) as usize;
+        let mut buf = vec![0u8; payload_hi - payload_lo];
+        copy_bit_bytes(words, payload_lo, &mut buf);
+        let dst = (lo - page) as usize;
+        image[dst..dst + buf.len()].copy_from_slice(&buf);
+        Ok(image)
+    }
+
+    fn fd_guard_pages(
+        &self,
+        pairs: &[(u64, u64)],
+        max_idx: u64,
+        zero_gap: bool,
+    ) -> Result<Vec<(u64, [u8; PAGE as usize])>, StoreError> {
+        let len = self.len.load(Ordering::Acquire);
+        let new_len = if max_idx < len { len } else { max_idx + 1 };
+        let old_logical = FILE_HEADER_LEN as u64 + len * ELEM;
+        let new_logical = FILE_HEADER_LEN as u64 + new_len * ELEM;
+        let mut pages = BTreeSet::new();
+        if new_logical != old_logical {
+            pages.insert(0u64);
+        }
+        // A slot is 8-aligned from offset 16, so it sits on one page. Sparse
+        // pairs image their own pages, not the span between them.
+        for &(index, _) in pairs {
+            pages.insert((Self::offset(index) / PAGE) * PAGE);
+        }
+        if zero_gap && max_idx >= len {
+            let mut page = (Self::offset(len) / PAGE) * PAGE;
+            let last = ((Self::offset(new_len) - 1) / PAGE) * PAGE;
+            while page <= last {
+                pages.insert(page);
+                page += PAGE;
             }
         }
-        if let Some(parent) = parent {
-            if !parent.as_os_str().is_empty() {
-                file::fsync_parent_dir(&parent).map_err(|e| StoreError::io(&parent, e))?;
+        let mut images = Vec::with_capacity(pages.len());
+        for page in pages {
+            let mut image = self.read_page(page)?;
+            if page == 0 {
+                image[..FILE_HEADER_LEN]
+                    .copy_from_slice(&file::encode_leading_header(self.file.kind, new_logical));
+            }
+            if zero_gap && max_idx >= len {
+                overlay_range(
+                    &mut image,
+                    page,
+                    Self::offset(len),
+                    Self::offset(new_len),
+                    0,
+                );
+            }
+            for &(index, value) in pairs {
+                overlay_bytes(&mut image, page, Self::offset(index), &value.to_le_bytes());
+            }
+            images.push((page, image));
+        }
+        Ok(images)
+    }
+
+    fn read_page(&self, page: u64) -> Result<[u8; PAGE as usize], StoreError> {
+        let mut image = [0u8; PAGE as usize];
+        let logical = self.file.logical_len();
+        if page >= logical {
+            return Ok(image);
+        }
+        let n = ((logical - page) as usize).min(PAGE as usize);
+        self.file.pread_all(page, &mut image[..n])?;
+        Ok(image)
+    }
+
+    fn arm_class_c(
+        &self,
+        pages: &[(u64, [u8; PAGE as usize])],
+    ) -> Result<Option<PathBuf>, StoreError> {
+        if pages.is_empty() {
+            return Ok(None);
+        }
+        let Some(dir) = self.file.path().parent() else {
+            return Err(StoreError::Rejected("page guard mark has no directory"));
+        };
+        let name = page_guard::guard_file_name(self.file.path())?;
+        let refs: Vec<(&str, u64, &[u8])> = pages
+            .iter()
+            .map(|(off, image)| (name, *off, image.as_slice()))
+            .collect();
+        page_guard::arm_store_group(dir, page_guard::CLASS_C_MARK, &refs)?;
+        Ok(Some(dir.join(page_guard::CLASS_C_MARK)))
+    }
+
+    /// Write the images of `span` from its start to its length, then that
+    /// length, without clearing `unstored_from`.
+    ///
+    /// Reads no live slot: a store after [`Self::guard_pages`] may have
+    /// moved one, and writing it beside a slot the span skips would put a
+    /// state on disk RAM never held. `(len, gen)` is the length written and
+    /// the generation sampled with the images. [`Self::publish_clean`]
+    /// consumes it after the mark is cleared.
+    pub(crate) fn persist_dirty(&self, span: &GuardSpan<'_>) -> Result<(u64, u64), StoreError> {
+        let stride = if self.byte_body { 1 } else { ELEM };
+        let lo = FILE_HEADER_LEN as u64 + span.start * stride;
+        let logical = FILE_HEADER_LEN as u64 + span.n * stride;
+        for (page, image) in &span.pages {
+            let from = (*page).max(lo);
+            let to = (*page + PAGE).min(logical);
+            if from < to {
+                let at = (from - *page) as usize;
+                self.file
+                    .write_at(from, &image[at..at + (to - from) as usize])?;
             }
         }
-        Ok(())
+        self.file.set_logical_len(logical)?;
+        Ok((span.n, span.gen))
+    }
+
+    /// Publish `disk_len = n` and a clean mark when `gen` is still current.
+    ///
+    /// A note that landed during the sync keeps the table dirty. The re-check
+    /// covers a note that passed the first load and stored its index after
+    /// the clean write.
+    pub(crate) fn publish_clean(&self, n: u64, gen: u64) {
+        if self.unstored_gen.load(Ordering::SeqCst) != gen {
+            return;
+        }
+        self.disk_len.store(n, Ordering::Release);
+        // SeqCst with `note_unstored`. With Release/Acquire the CLEAN store
+        // can sit behind the second load, and a note that lands between them
+        // is overwritten while that load still reads the old generation.
+        self.unstored_from.store(CLEAN, Ordering::SeqCst);
+        if self.unstored_gen.load(Ordering::SeqCst) != gen {
+            self.unstored_from.store(0, Ordering::SeqCst);
+        }
+    }
+
+    pub(crate) fn store_dir(&self) -> Result<&Path, StoreError> {
+        match self.file.path().parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => Ok(parent),
+            _ => Err(StoreError::Rejected("page guard mark has no directory")),
+        }
+    }
+
+    pub(crate) fn guard_name(&self) -> Result<&str, StoreError> {
+        page_guard::guard_file_name(self.file.path())
     }
 
     pub fn flush_dirty(&self) -> Result<(), StoreError> {
@@ -1458,9 +1535,6 @@ impl ArrayTable {
         }
         between(self, FlushStep::Admit);
         seq_arm(&self.seq, &self.flushing);
-        // After stores are excluded. A test hold pauses the tip flush here.
-        #[cfg(debug_assertions)]
-        flush_hold::wait();
         let from = self.unstored_from.load(Ordering::Acquire);
         let n = self.len.load(Ordering::Acquire);
         let disk = self.disk_len.load(Ordering::Acquire);

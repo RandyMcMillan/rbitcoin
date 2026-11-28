@@ -79,9 +79,29 @@ pub fn write_tmp_rename(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
 
 /// Write `bytes` to a sibling tmp, `sync_all`, then rename over `path`.
 pub fn write_synced_tmp_rename(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
-    write_tmp_synced(path, TmpSync::FileAndDir, |f| {
-        f.write_all(bytes).map_err(|e| StoreError::io(path, e))
-    })
+    write_synced_tmp_rename_then(path, bytes, || Ok(()))
+}
+
+/// Sync the temp file, run `after_sync`, then rename over `path`.
+///
+/// `after_sync` drops a page guard that still names `path`. The new bytes
+/// are durable before that drop, and the live name changes only after it.
+pub fn write_synced_tmp_rename_then<F>(
+    path: &Path,
+    bytes: &[u8],
+    after_sync: F,
+) -> Result<(), StoreError>
+where
+    F: FnOnce() -> Result<(), StoreError>,
+{
+    write_named_tmp(
+        &tmp_sidecar_path(path),
+        path,
+        TmpSync::FileAndDir,
+        false,
+        |f| f.write_all(bytes).map_err(|e| StoreError::io(path, e)),
+        after_sync,
+    )
 }
 
 /// Write `bytes` to a sibling tmp and `sync_all` the file before rename.
@@ -91,6 +111,16 @@ pub fn write_file_synced_tmp_rename(path: &Path, bytes: &[u8]) -> Result<(), Sto
     write_tmp_synced(path, TmpSync::File, |f| {
         f.write_all(bytes).map_err(|e| StoreError::io(path, e))
     })
+}
+
+/// Write a small [`TableKind::ArrayLink`] table holding `payload` after its
+/// header, through a synced tmp and a rename. The name appears only with
+/// its bytes durable, so a crash leaves the whole file or none.
+pub fn write_meta_file(path: &Path, payload: &[u8]) -> Result<(), StoreError> {
+    let logical = FILE_HEADER_LEN as u64 + payload.len() as u64;
+    let mut bytes = encode_leading_header(TableKind::ArrayLink, logical).to_vec();
+    bytes.extend_from_slice(payload);
+    write_synced_tmp_rename(path, &bytes)
 }
 
 /// Stream `write` into a sibling tmp, `sync_all`, then rename over `path`.
@@ -126,27 +156,36 @@ where
 /// its own `tmp` name, so one writer cannot truncate another's staging file.
 /// `tmp` must be on the same filesystem as `path` for the rename to be atomic.
 pub fn write_synced_tmp_rename_at(tmp: &Path, path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
-    write_named_tmp(tmp, path, TmpSync::FileAndDir, false, |f| {
-        f.write_all(bytes).map_err(|e| StoreError::io(path, e))
-    })
+    write_named_tmp(
+        tmp,
+        path,
+        TmpSync::FileAndDir,
+        false,
+        |f| f.write_all(bytes).map_err(|e| StoreError::io(path, e)),
+        || Ok(()),
+    )
 }
 
 fn write_tmp_with<F>(path: &Path, sync: TmpSync, private: bool, write: F) -> Result<(), StoreError>
 where
     F: FnOnce(&mut File) -> Result<(), StoreError>,
 {
-    write_named_tmp(&tmp_sidecar_path(path), path, sync, private, write)
+    write_named_tmp(&tmp_sidecar_path(path), path, sync, private, write, || {
+        Ok(())
+    })
 }
 
-fn write_named_tmp<F>(
+fn write_named_tmp<F, A>(
     tmp: &Path,
     path: &Path,
     sync: TmpSync,
     private: bool,
     write: F,
+    after_sync: A,
 ) -> Result<(), StoreError>
 where
     F: FnOnce(&mut File) -> Result<(), StoreError>,
+    A: FnOnce() -> Result<(), StoreError>,
 {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -160,6 +199,7 @@ where
             f.durable_sync_all().map_err(|e| StoreError::io(tmp, e))?;
         }
     }
+    after_sync()?;
     std::fs::rename(tmp, path).map_err(|e| StoreError::io(path, e))?;
     if sync == TmpSync::FileAndDir {
         if let Some(parent) = path.parent() {
@@ -186,11 +226,23 @@ fn open_tmp(tmp: &Path, private: bool) -> std::io::Result<File> {
     opts.open(tmp)
 }
 
+/// `Corrupt` when `path` is already present. `msg` names that file.
+pub(crate) fn refuse_if_present(path: &Path, msg: &'static str) -> Result<(), StoreError> {
+    if path.try_exists().map_err(|e| StoreError::io(path, e))? {
+        return Err(StoreError::Corrupt(msg));
+    }
+    Ok(())
+}
+
 /// `fsync` the directory so a renamed dirent survives a crash.
 ///
 /// Windows denies a directory handle (`ERROR_ACCESS_DENIED`), including with
 /// backup semantics. The file itself was already `sync_all`'d before rename.
 pub fn fsync_parent_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(debug_assertions)]
+    if crate::io_handle::take_fail_dir_sync_on_thread() {
+        return Err(std::io::Error::other("injected directory sync failure"));
+    }
     #[cfg(unix)]
     {
         let result = std::fs::File::open(dir)?.durable_sync_all();
@@ -207,10 +259,12 @@ pub fn fsync_parent_dir(dir: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Record directories passed to [`fsync_parent_dir`] on this thread.
+/// Record directories passed to [`fsync_parent_dir`] on this thread, and
+/// table files [`TableFile::sync_data_only`] synced, in order.
 ///
 /// Debug tests use this to check that `store/` is synced after
-/// `seqsigwit.window` exists. A release build does not record.
+/// `seqsigwit.window` exists, or that a header is synced before its name.
+/// A release build does not record.
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub fn arm_fsync_dir_trace() {
@@ -318,6 +372,10 @@ pub struct TableFile {
     /// Header still names a longer end than `published_len`. A grow must store
     /// the short end before it extends the file, or open loads the old end.
     hwm_behind: AtomicBool,
+    /// A failed [`crate::page_guard::commit_appends`] may have published a
+    /// length its group's other files do not match. Every write is refused
+    /// until reopen; reads go on.
+    poisoned: AtomicBool,
     /// One flusher at a time, so a second never returns before the first's sync.
     pub flush_lock: Mutex<()>,
     /// [`GrowPolicy`] as u8. Idx uses 1 MiB; SH body uses 64 KiB; Class A slabs.
@@ -462,6 +520,8 @@ impl TableFile {
         // Capacity first, then header via overlapped-safe pwrite (not std Write).
         set_file_len(&file, &path, initial)?;
         handle_pwrite_all(&file, &path, 0, &header)?;
+        #[cfg(feature = "write-probe")]
+        crate::write_probe::created_leading(&path);
         let read_file = file.try_clone().map_err(|e| StoreError::io(&path, e))?;
 
         Ok(Self {
@@ -476,6 +536,7 @@ impl TableFile {
             kind,
             needs_sync: AtomicBool::new(false),
             hwm_behind: AtomicBool::new(false),
+            poisoned: AtomicBool::new(false),
             flush_lock: Mutex::new(()),
             grow_policy: AtomicU8::new(GrowPolicy::Slab as u8),
         })
@@ -494,6 +555,8 @@ impl TableFile {
             .map_err(|e| StoreError::io(&path, e))?;
         let initial = TRAILING_FOOTER_LEN as u64;
         set_file_len(&file, &path, initial)?;
+        #[cfg(feature = "write-probe")]
+        crate::write_probe::created_trailing(&path);
         let read_file = file.try_clone().map_err(|e| StoreError::io(&path, e))?;
         let s = Self {
             path,
@@ -507,6 +570,7 @@ impl TableFile {
             kind,
             needs_sync: AtomicBool::new(false),
             hwm_behind: AtomicBool::new(false),
+            poisoned: AtomicBool::new(false),
             flush_lock: Mutex::new(()),
             grow_policy: AtomicU8::new(GrowPolicy::Slab as u8),
         };
@@ -547,6 +611,8 @@ impl TableFile {
         let mut trailing_ext = [0u8; 16];
         trailing_ext.copy_from_slice(&footer[16..32]);
         let logical = expect;
+        #[cfg(feature = "write-probe")]
+        crate::write_probe::opened_trailing(&path, logical);
         let read_file = file.try_clone().map_err(|e| StoreError::io(&path, e))?;
         Ok((
             Self {
@@ -561,6 +627,7 @@ impl TableFile {
                 kind,
                 needs_sync: AtomicBool::new(false),
                 hwm_behind: AtomicBool::new(false),
+                poisoned: AtomicBool::new(false),
                 flush_lock: Mutex::new(()),
                 grow_policy: AtomicU8::new(GrowPolicy::Slab as u8),
             },
@@ -646,7 +713,7 @@ impl TableFile {
         footer[8..16].copy_from_slice(&logical.to_le_bytes());
         footer[16..32].copy_from_slice(&self.trailing_ext);
         self.ensure_capacity(logical)?;
-        self.pwrite_all(base, &footer)
+        self.pwrite_length(self.header_len_to_persist(), base, &footer)
     }
 
     pub fn open(path: impl Into<PathBuf>, kind: TableKind) -> Result<Self, StoreError> {
@@ -692,6 +759,8 @@ impl TableFile {
 
         let file_len = file.metadata().map_err(|e| StoreError::io(&path, e))?.len();
         let mut logical = le_u64!(header, 8);
+        #[cfg(feature = "write-probe")]
+        crate::write_probe::opened_leading(&path, logical);
         if logical < FILE_HEADER_LEN as u64 {
             logical = FILE_HEADER_LEN as u64;
         }
@@ -713,6 +782,7 @@ impl TableFile {
             kind,
             needs_sync: AtomicBool::new(hwm_behind),
             hwm_behind: AtomicBool::new(hwm_behind),
+            poisoned: AtomicBool::new(false),
             flush_lock: Mutex::new(()),
             grow_policy: AtomicU8::new(GrowPolicy::Slab as u8),
         })
@@ -747,6 +817,7 @@ impl TableFile {
 
     /// Shrink or set logical length (must be ≥ header/trailer size). Does not zero freed bytes.
     pub fn set_logical_len(&self, logical: u64) -> Result<(), StoreError> {
+        self.refuse_if_poisoned()?;
         let min = if self.trailing_header {
             TRAILING_FOOTER_LEN as u64
         } else {
@@ -769,6 +840,25 @@ impl TableFile {
         Ok(())
     }
 
+    /// Refuse every later write to this file until reopen. Set when an
+    /// append group failed, or by a caller whose own commit failed after it.
+    pub fn poison(&self) {
+        self.poisoned.store(true, Ordering::Release);
+    }
+
+    pub fn poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn refuse_if_poisoned(&self) -> Result<(), StoreError> {
+        if self.poisoned() {
+            return Err(StoreError::Rejected(
+                "an earlier append to this file failed; reopen the store",
+            ));
+        }
+        Ok(())
+    }
+
     /// Publish `logical` and drop the file allocation past it.
     ///
     /// [`Self::set_logical_len`] leaves the fallocated tail in place. Prune
@@ -787,6 +877,7 @@ impl TableFile {
     /// For files whose lengths a separate commit names: a header write would
     /// rewrite the first block, and a cut on a block boundary rewrites none.
     pub fn shrink_to(&self, len: u64) -> Result<(), StoreError> {
+        self.refuse_if_poisoned()?;
         let file = self.file.lock().unwrap_or_else(|e| e.into_inner());
         let now = file
             .metadata()
@@ -888,6 +979,133 @@ impl TableFile {
     /// Complete pwrite of all bytes or error (no partial success returned).
     #[doc(hidden)]
     pub fn pwrite_all(&self, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
+        self.pwrite_checked(self.header_len_to_persist(), offset, bytes)
+    }
+
+    /// [`Self::pwrite_all`] against a `committed` end the caller sampled.
+    fn pwrite_checked(&self, committed: u64, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
+        self.refuse_if_poisoned()?;
+        #[cfg(feature = "write-probe")]
+        let _landing = self.probe(
+            committed,
+            offset,
+            bytes,
+            crate::write_probe::WriteKind::Payload,
+        );
+        self.pwrite_door(committed, offset, bytes)
+    }
+
+    /// [`Self::pwrite_checked`] for the length a flush republishes. A
+    /// poisoned file still takes it: an append group publishes a length only
+    /// after its bytes are synced, so the RAM length names durable bytes.
+    /// Nothing else may move that length: every publisher refuses a
+    /// poisoned file before it changes RAM.
+    fn pwrite_length(&self, committed: u64, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
+        #[cfg(feature = "write-probe")]
+        let landing = self.probe(
+            committed,
+            offset,
+            bytes,
+            crate::write_probe::WriteKind::Length,
+        );
+        let res = self.pwrite_door(committed, offset, bytes);
+        #[cfg(feature = "write-probe")]
+        match &res {
+            Ok(()) => landing.landed(),
+            Err(_) => landing.failed(),
+        }
+        res
+    }
+
+    /// Classify a payload write that bypasses the door (bulk io_uring) as the
+    /// door would. Hold the landing until that write returns.
+    #[cfg(feature = "write-probe")]
+    pub(crate) fn probe_bulk_write(
+        &self,
+        offset: u64,
+        bytes: &[u8],
+    ) -> crate::write_probe::Landing {
+        self.probe(
+            self.header_len_to_persist(),
+            offset,
+            bytes,
+            crate::write_probe::WriteKind::Payload,
+        )
+    }
+
+    /// Write probe: a zeroed range, in the chunks the fallback writes.
+    #[cfg(feature = "write-probe")]
+    fn probe_zero(
+        &self,
+        committed: u64,
+        offset: u64,
+        len: u64,
+    ) -> Vec<crate::write_probe::Landing> {
+        let zero = vec![0u8; len.min(1024 * 1024) as usize];
+        let mut out = Vec::new();
+        let mut at = 0u64;
+        while at < len {
+            let n = ((len - at) as usize).min(zero.len());
+            out.push(self.probe(
+                committed,
+                offset + at,
+                &zero[..n],
+                crate::write_probe::WriteKind::Payload,
+            ));
+            at += n as u64;
+        }
+        out
+    }
+
+    /// Write probe: the handle that holds this file's leading header. A
+    /// trailing table has none.
+    #[cfg(feature = "write-probe")]
+    fn probe_file(&self) -> Option<&File> {
+        (!self.trailing_header).then_some(&self.read_file)
+    }
+
+    /// Write probe: the leading header end this file holds now.
+    #[cfg(feature = "write-probe")]
+    fn probe_header(&self) -> Option<u64> {
+        crate::write_probe::header_on(self.probe_file()?, &self.path)
+    }
+
+    #[cfg(feature = "write-probe")]
+    fn probe(
+        &self,
+        committed: u64,
+        offset: u64,
+        bytes: &[u8],
+        kind: crate::write_probe::WriteKind,
+    ) -> crate::write_probe::Landing {
+        // The header in the file, not the RAM length: a publish moves RAM first.
+        let committed = self.probe_header().unwrap_or(committed);
+        crate::write_probe::write(
+            &self.path,
+            committed,
+            offset,
+            bytes,
+            self.trailing_header,
+            if self.trailing_header {
+                0
+            } else {
+                FILE_HEADER_LEN as u64
+            },
+            kind,
+        )
+    }
+
+    fn pwrite_door(&self, committed: u64, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
+        if !bytes.is_empty() {
+            // Committed end is the durable header, not a RAM high-water.
+            // A shared page has to be one this file's current arm names.
+            crate::page_guard::check_armed_write(
+                &self.path,
+                committed,
+                offset,
+                bytes.len() as u64,
+            )?;
+        }
         handle_pwrite_all(&self.read_file, &self.path, offset, bytes)
     }
 
@@ -919,12 +1137,20 @@ impl TableFile {
         self.pread_at(offset, buf)
     }
 
+    /// Publish bytes below the committed end only when this file has no live
+    /// `page_guard` arm or those pages are the ones it names. Bytes at or past
+    /// the committed end are an append. The committed end is the durable
+    /// header length, not a RAM high-water.
     pub fn write_at(&self, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
         self.write_at_pwrite(offset, bytes)
     }
 
-    /// Payload past the published end. `published_len` stays put until the
-    /// caller commits, so a later failed write does not move readers.
+    /// Bytes at or past the committed end, including the committed tail block.
+    ///
+    /// That is the append door (crash-recovery.md, the sector rule).
+    /// `published_len` stays
+    /// put until the caller commits, so a later failed write does not move
+    /// readers.
     pub fn write_uncommitted(&self, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
         if bytes.is_empty() {
             return Ok(());
@@ -944,12 +1170,17 @@ impl TableFile {
     /// error with the RAM length already moved, as [`Self::publish_end`]
     /// does.
     pub fn write_at_pwrite(&self, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
+        self.write_published(self.header_len_to_persist(), offset, bytes)
+    }
+
+    /// [`Self::write_at_pwrite`] against a `committed` end the caller sampled.
+    fn write_published(&self, committed: u64, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
         if bytes.is_empty() {
             return Ok(());
         }
         let end = offset.saturating_add(bytes.len() as u64);
         self.ensure_capacity(end)?;
-        self.pwrite_all(offset, bytes)?;
+        self.pwrite_checked(committed, offset, bytes)?;
         let landed = self.publish_end(end, true);
         self.needs_sync.store(true, Ordering::Release);
         if !landed {
@@ -967,8 +1198,12 @@ impl TableFile {
     /// [`Self::write_at`]. Otherwise only RAM moves, and `flush` keeps the
     /// previous header. A failed header pwrite does not roll RAM back.
     /// Returns whether the on-disk header names `end` or already covered it.
+    /// A poisoned file returns false and moves nothing.
     #[must_use]
     pub fn publish_end(&self, end: u64, durable: bool) -> bool {
+        if self.poisoned() {
+            return false;
+        }
         if !durable {
             self.publish_ram_only(end);
             return false;
@@ -985,9 +1220,12 @@ impl TableFile {
     /// Locator publish. Same one header pwrite as [`Self::publish_end`] when
     /// the write lands. A miss keeps the previous durable end so a later
     /// [`Self::catch_up_header`] can store it. The success path does not take
-    /// the flush lock.
+    /// the flush lock. A poisoned file returns false and moves nothing.
     #[must_use]
     pub fn publish_locator_end(&self, end: u64, durable: bool) -> bool {
+        if self.poisoned() {
+            return false;
+        }
         if !durable {
             self.publish_ram_only(end);
             return false;
@@ -1026,6 +1264,23 @@ impl TableFile {
         }
         self.header_cap.store(0, Ordering::Release);
         true
+    }
+
+    /// Write `end` as the header length and sync it. `end` names bytes the
+    /// caller already synced. A RAM-only append past `end` stays past the
+    /// header, so a later flush still cannot publish it unsynced.
+    pub fn publish_synced_len(&self, end: u64) -> Result<(), StoreError> {
+        {
+            let _hold = self.flush_lock.lock().unwrap_or_else(|e| e.into_inner());
+            let cap = self.header_cap.load(Ordering::Acquire);
+            if cap != 0 && end > cap {
+                self.persist_hwm(end)?;
+                let ram = self.published_len.load(Ordering::Acquire);
+                self.header_cap
+                    .store(if ram > end { end } else { 0 }, Ordering::Release);
+            }
+        }
+        self.sync_data_only()
     }
 
     /// Loc, overflow, and checkpoint headers for one locator family.
@@ -1285,13 +1540,32 @@ impl TableFile {
     }
 
     /// Punch a hole over `[offset, offset+len)`.
+    ///
+    /// A range below the committed end of a file with a live `page_guard` arm
+    /// has to be inside the pages that arm names. The committed end is the
+    /// durable header length.
     pub fn zero_range(&self, offset: u64, len: u64) -> Result<(), StoreError> {
         if len == 0 {
             return Ok(());
         }
+        // The punch below skips `pwrite_checked`, so refuse here.
+        self.refuse_if_poisoned()?;
+        // One committed end for the whole call. A fallback chunk publishes
+        // its end, and those zeros are not a committed page the next chunk
+        // shares.
+        let committed = self.header_len_to_persist();
+        crate::page_guard::check_armed_write(&self.path, committed, offset, len)?;
         self.ensure_capacity(offset.saturating_add(len))?;
+        // The punch changes these bytes like the fallback's writes do, so the
+        // probe records the same payload ranges.
+        #[cfg(feature = "write-probe")]
+        let _landings = self.probe_zero(committed, offset, len);
         let file = self.file.lock().unwrap();
-        if try_punch_hole(&file, offset, len).is_ok() {
+        #[cfg(debug_assertions)]
+        let punched = !take_no_punch_hole(&self.path) && try_punch_hole(&file, offset, len).is_ok();
+        #[cfg(not(debug_assertions))]
+        let punched = try_punch_hole(&file, offset, len).is_ok();
+        if punched {
             return Ok(());
         }
         drop(file);
@@ -1299,15 +1573,23 @@ impl TableFile {
         let mut written = 0u64;
         while written < len {
             let chunk = ((len - written) as usize).min(zero.len());
-            self.write_at(offset + written, &zero[..chunk])?;
+            self.write_published(committed, offset + written, &zero[..chunk])?;
             written += chunk as u64;
         }
         Ok(())
     }
 
-    /// Persist 8-byte HWM field (complete pwrite of the unit).
+    /// Persist 8-byte HWM field (complete pwrite of the unit). Refused on a
+    /// poisoned file; only a flush republishes there.
     #[doc(hidden)]
     pub fn persist_hwm(&self, logical: u64) -> Result<(), StoreError> {
+        self.refuse_if_poisoned()?;
+        self.republish_hwm(logical)
+    }
+
+    /// [`Self::persist_hwm`] for the length a flush samples. A poisoned file
+    /// takes it, as [`Self::pwrite_length`] says.
+    fn republish_hwm(&self, logical: u64) -> Result<(), StoreError> {
         let bytes = logical.to_le_bytes();
         let hwm_off = if self.trailing_header {
             logical
@@ -1316,7 +1598,7 @@ impl TableFile {
         } else {
             8
         };
-        self.pwrite_all(hwm_off, &bytes)
+        self.pwrite_length(self.header_len_to_persist(), hwm_off, &bytes)
     }
 
     #[doc(hidden)]
@@ -1325,7 +1607,7 @@ impl TableFile {
             // Full trailer is the durability unit (magic+schema+kind+HWM+ext).
             self.write_trailer(logical)?;
         } else {
-            self.persist_hwm(logical)?;
+            self.republish_hwm(logical)?;
         }
         Ok(())
     }
@@ -1347,9 +1629,16 @@ impl TableFile {
                 std::io::Error::from_raw_os_error(5),
             ));
         }
+        #[cfg(feature = "write-probe")]
+        let probe_n = crate::write_probe::sync_begin(&self.path, self.probe_file());
         self.read_file
             .durable_sync_data()
-            .map_err(|e| StoreError::io(&self.path, e))
+            .map_err(|e| StoreError::io(&self.path, e))?;
+        #[cfg(all(unix, debug_assertions))]
+        note_fsynced_dir(&self.path);
+        #[cfg(feature = "write-probe")]
+        crate::write_probe::synced(&self.path, probe_n);
+        Ok(())
     }
 
     /// [`Self::sync_data_only`] on every file, with the waits overlapped.
@@ -1389,6 +1678,11 @@ impl TableFile {
         if crate::durability::flushes_skipped() {
             return Ok(());
         }
+        #[cfg(feature = "write-probe")]
+        let probe_n: Vec<_> = files
+            .iter()
+            .map(|f| crate::write_probe::sync_begin(&f.path, f.probe_file()))
+            .collect();
         let mut handles: Vec<_> = files.iter().map(|f| f.io_handle()).collect();
         handles.extend(
             extra
@@ -1422,6 +1716,10 @@ impl TableFile {
                 r => return Err(StoreError::io(*path, std::io::Error::from_raw_os_error(-r))),
             }
         }
+        #[cfg(feature = "write-probe")]
+        for (f, n) in files.iter().zip(probe_n) {
+            crate::write_probe::synced(&f.path, n);
+        }
         Ok(())
     }
 
@@ -1453,11 +1751,23 @@ impl TableFile {
     pub fn persist_and_sync(&self) -> Result<(), StoreError> {
         let logical = self.header_len_to_persist();
         self.persist_logical_len(logical)?;
+        #[cfg(debug_assertions)]
+        if crate::io_handle::take_fail_flush(self.io_handle()) {
+            return Err(StoreError::io(
+                &self.path,
+                std::io::Error::from_raw_os_error(5),
+            ));
+        }
+        #[cfg(feature = "write-probe")]
+        let probe_n = crate::write_probe::sync_begin(&self.path, self.probe_file());
         self.file
             .lock()
             .unwrap()
             .durable_sync_data()
-            .map_err(|e| StoreError::io(&self.path, e))
+            .map_err(|e| StoreError::io(&self.path, e))?;
+        #[cfg(feature = "write-probe")]
+        crate::write_probe::synced(&self.path, probe_n);
+        Ok(())
     }
 
     /// Persist HWM / trailer without waiting on `sync_data`.
@@ -1659,6 +1969,30 @@ pub fn try_fallocate(file: &File, len: u64) -> std::io::Result<()> {
             "fallocate unavailable",
         ))
     }
+}
+
+#[cfg(debug_assertions)]
+static NO_PUNCH_HOLE: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// The next [`TableFile::zero_range`] on `path` takes the zero-write
+/// fallback, as on a filesystem without hole punching.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn skip_next_punch_hole(path: &Path) {
+    NO_PUNCH_HOLE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(path.to_path_buf());
+}
+
+#[cfg(debug_assertions)]
+fn take_no_punch_hole(path: &Path) -> bool {
+    let mut armed = NO_PUNCH_HOLE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(i) = armed.iter().position(|p| p == path) else {
+        return false;
+    };
+    armed.remove(i);
+    true
 }
 
 #[doc(hidden)]

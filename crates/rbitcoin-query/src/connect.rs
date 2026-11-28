@@ -796,9 +796,7 @@ impl Query {
 
         let write = rbitcoin_store::ClassCWrite::new();
         if !header_ranges.is_empty() {
-            self.store
-                .header_txs
-                .put_ranges_batch(&write, header_ranges)?;
+            self.store.put_header_ranges(&write, header_ranges)?;
         }
 
         let t_strong = std::time::Instant::now();
@@ -1481,6 +1479,31 @@ impl Query {
         Ok(outs)
     }
 
+    /// Drop `height` from `confirmed[]`, publish the new tip, and make the
+    /// shrink durable.
+    fn shrink_tip_for_disconnect(
+        &self,
+        write: &rbitcoin_store::ClassCWrite,
+        height: Height,
+    ) -> Result<(), QueryError> {
+        self.store.confirmed.disconnect_tip(write, height)?;
+        self.store.height_fence_pop_tip(height);
+        self.note_disconnect_height(height.0);
+        let _ = self.on_load_pack();
+        if let Some(new_tip) = self.tip_height() {
+            let (_, rec) = self
+                .header_at_height(new_tip)?
+                .ok_or(StoreError::Corrupt("disconnect left a tip with no header"))?;
+            self.publish_confirmed_tip(new_tip.0, rec.hash);
+            let _ = self.ensure_height_by_hash_index(new_tip);
+        } else {
+            self.clear_published_tip();
+            self.invalidate_height_by_hash_index();
+        }
+        self.store.flush_confirmed_only()?;
+        Ok(())
+    }
+
     /// Disconnect the current tip (Class C + scripthash create unlink; archive remains).
     ///
     /// Durable point edges remain for archive history; strong bits cleared below.
@@ -1581,21 +1604,16 @@ impl Query {
         };
 
         let write = rbitcoin_store::ClassCWrite::new();
-        self.store.confirmed.disconnect_tip(&write, height)?;
-        self.store.height_fence_pop_tip(height);
-        self.note_disconnect_height(height.0);
-        let _ = self.on_load_pack();
-        if let Some(new_tip) = self.tip_height() {
-            let (_, rec) = self
-                .header_at_height(new_tip)?
-                .ok_or(StoreError::Corrupt("disconnect left a tip with no header"))?;
-            self.publish_confirmed_tip(new_tip.0, rec.hash);
-            let _ = self.ensure_height_by_hash_index(new_tip);
-        } else {
-            self.clear_published_tip();
-            self.invalidate_height_by_hash_index();
+        let shrunk = self.shrink_tip_for_disconnect(&write, height);
+        if shrunk.is_err() && sh_window.is_some() {
+            // The unlinks name a block the disk tip may still hold. A later
+            // sync would make that index look whole, so only a rebuild may
+            // clear the mark.
+            if let Err(e) = self.store.scripthash.hold_dirty() {
+                self.mark_sh_degraded(&format!("disconnect h={} hold mark: {e}", height.0));
+            }
         }
-        self.store.flush_confirmed_only()?;
+        shrunk?;
         self.sealed_tip.shrunk_to(self.tip_height());
         if !self.sh_degraded() {
             if let Err(e) = self.store.scripthash.commit_deferred_empty_heads() {

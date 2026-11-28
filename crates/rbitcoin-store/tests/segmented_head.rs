@@ -46,6 +46,74 @@ fn ensure_open_reuses_unsealed_tail_and_meta_decodes() {
 }
 
 #[test]
+fn old_segment_without_the_mlt_bit_loads_an_empty_map() {
+    let dir = tmp();
+    let layout = HeadLayout::new(8).unwrap();
+    let h = SegmentedTxHead::create(&dir, layout).unwrap();
+    let pairs = vec![(fuse_key_from_mixed(&mixed(1)), 1u32)];
+    let published = h.write_sealed_pairs(0, 1, 1, pairs).unwrap();
+    let base = segment_head_path(&dir, 0);
+    assert_eq!(
+        std::fs::read(rbitcoin_store::tx_head_mphf::mlt_path(&base)).unwrap(),
+        0u32.to_le_bytes(),
+        "an empty multi-list is a renamed file"
+    );
+    h.install_rebuild_sealed(vec![(1, 1, published)], 2)
+        .unwrap();
+    let (bits, descs) = read_meta(&dir).unwrap();
+    let sealed = descs.iter().find(|d| d.count == 1).unwrap();
+    assert_eq!(sealed.flags & 4, 4, "seal sets the mlt flag");
+    let cleared: Vec<(u64, u64, u32, u32)> = descs
+        .iter()
+        .map(|d| (d.first_fk, d.count, d.file_id, d.flags & !4))
+        .collect();
+    write_meta(&dir, bits, &cleared).unwrap();
+    std::fs::remove_file(rbitcoin_store::tx_head_mphf::mlt_path(&base)).unwrap();
+    drop(h);
+    let h = SegmentedTxHead::open(&dir).unwrap();
+    let pack = h
+        .segments_snapshot()
+        .iter()
+        .find(|s| s.sealed)
+        .unwrap()
+        .pack
+        .as_ref()
+        .unwrap()
+        .clone();
+    assert!(
+        pack.mlt.is_empty(),
+        "a missing file without the bit is empty"
+    );
+    assert_eq!(h.probe_candidates(&mixed(1)).unwrap(), vec![Fk(1)]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn sealed_segment_missing_mlt_is_corrupt_not_a_refuse() {
+    let dir = tmp();
+    let layout = HeadLayout::new(8).unwrap();
+    let h = SegmentedTxHead::create(&dir, layout).unwrap();
+    let pairs = vec![(fuse_key_from_mixed(&mixed(1)), 1u32)];
+    let published = h.write_sealed_pairs(0, 1, 1, pairs).unwrap();
+    h.install_rebuild_sealed(vec![(1, 1, published)], 2)
+        .unwrap();
+    let base = segment_head_path(&dir, 0);
+    std::fs::remove_file(rbitcoin_store::tx_head_mphf::mlt_path(&base)).unwrap();
+    drop(h);
+    match SegmentedTxHead::open(&dir) {
+        Err(e) => {
+            assert!(!is_index_open_refuse(&e), "{e}");
+            match e {
+                StoreError::Corrupt(m) => assert!(m.contains("mlt"), "{m}"),
+                other => panic!("{other}"),
+            }
+        }
+        Ok(_) => panic!("a sealed segment with the bit and no .mlt opened"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn probe_candidates_batch_empty_is_empty() {
     let dir = tmp();
     let layout = HeadLayout::new(10).unwrap();

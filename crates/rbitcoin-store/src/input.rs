@@ -257,6 +257,47 @@ impl Input {
     }
 
     pub fn append(&self, txs: &[Vec<InputEdge>]) -> Result<(), StoreError> {
+        self.write_rows(txs, true)
+    }
+
+    /// [`Self::append`] that moves only the RAM lengths. Readers see the rows.
+    /// The headers keep their durable lengths until [`Self::publish_staged`].
+    ///
+    /// For rows inside creates Class A already synced (the open-time backfill):
+    /// no later barrier cuts them, so a length must not land before its rows.
+    pub fn append_staged(&self, txs: &[Vec<InputEdge>]) -> Result<(), StoreError> {
+        self.write_rows(txs, false)
+    }
+
+    /// Sync the staged rows, then publish and sync each length: body and
+    /// checkpoints before the locator that counts creates.
+    pub fn publish_staged(&self) -> Result<(), StoreError> {
+        let files = [&self.body, &self.off, &self.loc];
+        for f in files {
+            f.sync_data_only()?;
+        }
+        for f in files {
+            if !f.catch_up_header() {
+                return Err(StoreError::io(
+                    f.path(),
+                    std::io::Error::other("input length write failed"),
+                ));
+            }
+            f.flush()?;
+        }
+        Ok(())
+    }
+
+    fn write_rows(&self, txs: &[Vec<InputEdge>], publish: bool) -> Result<(), StoreError> {
+        let put = |file: &TableFile, at: u64, bytes: &[u8]| -> Result<(), StoreError> {
+            if publish {
+                return file.write_at(at, bytes);
+            }
+            file.write_uncommitted(at, bytes)?;
+            // RAM only: the header keeps the durable length.
+            let _ = file.publish_end(at + bytes.len() as u64, false);
+            Ok(())
+        };
         if txs.is_empty() {
             return Ok(());
         }
@@ -285,9 +326,9 @@ impl Input {
         // prefix. Open cuts a body that ran ahead of a short locator.
         if !body_bytes.is_empty() {
             let body_start = self.body_end.load(Ordering::Acquire);
-            self.body.write_at(body_start, &body_bytes)?;
+            put(&self.body, body_start, &body_bytes)?;
         }
-        self.loc.write_at(loc_at, &loc_bytes)?;
+        put(&self.loc, loc_at, &loc_bytes)?;
         if !new_offs.is_empty() {
             {
                 let cps = self.checkpoints.read().unwrap_or_else(|e| e.into_inner());
@@ -300,7 +341,7 @@ impl Input {
                 blob.extend_from_slice(&abs.to_le_bytes());
             }
             let off_at = FILE_HEADER_LEN as u64 + new_offs[0].0 * OFF_SLOT;
-            self.off.write_at(off_at, &blob)?;
+            put(&self.off, off_at, &blob)?;
             let mut cps = self.checkpoints.write().unwrap_or_else(|e| e.into_inner());
             for &(w, abs) in &new_offs {
                 if w as usize != cps.len() {

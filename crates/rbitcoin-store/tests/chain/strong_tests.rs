@@ -559,6 +559,5 @@ fn strong_partial_bytes_unstrong_range_and_errors() {
         Err(StoreError::InvalidFk)
     ));
     assert!(matches!(t.is_strong(Fk::NULL), Err(StoreError::InvalidFk)));
-    t.flush_async().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }

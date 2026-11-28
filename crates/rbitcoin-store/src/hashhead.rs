@@ -14,15 +14,12 @@
 //! fd pread/pwrite. Probe walks reuse the same chunk cache so
 //! a hop is not one pread per open-address step.
 
-use crate::durability::Durable as _;
 use crate::error::StoreError;
 use crate::file::{self, TableFile, FILE_HEADER_LEN};
-use bitcoin_hashes::{sha256, Hash, HashEngine};
+use crate::page_guard::{self, PAGE};
 use rbitcoin_primitives::{bytes, le_u64, Fk, TableKind};
 use std::collections::BTreeMap;
-#[cfg(debug_assertions)]
 use std::collections::BTreeSet;
-use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -196,6 +193,8 @@ pub fn sh_main_shard_count(scale: HeadScale) -> usize {
 pub struct MultiList {
     pub file: TableFile,
     pub count: Mutex<u64>,
+    /// Records `append` assigned that `SlotPageCache::flush` has not written.
+    pending: Mutex<Vec<(u64, [u8; MULTI_REC_LEN])>>,
 }
 
 impl MultiList {
@@ -215,6 +214,7 @@ impl MultiList {
         Ok(Self {
             file,
             count: Mutex::new(0),
+            pending: Mutex::new(Vec::new()),
         })
     }
 
@@ -232,6 +232,7 @@ impl MultiList {
         Ok(Self {
             file,
             count: Mutex::new(body / MULTI_REC_LEN as u64),
+            pending: Mutex::new(Vec::new()),
         })
     }
 
@@ -243,11 +244,12 @@ impl MultiList {
     #[doc(hidden)]
     pub fn append(&self, create_fk: Fk, next: Fk) -> Result<Fk, StoreError> {
         let mut count = self.count.lock().unwrap();
+        let mut pending = self.pending.lock().unwrap();
         let id = *count + 1;
         let mut buf = [0u8; MULTI_REC_LEN];
         buf[0..8].copy_from_slice(&create_fk.0.to_le_bytes());
         buf[8..16].copy_from_slice(&next.0.to_le_bytes());
-        self.file.write_at(Self::offset(id), &buf)?;
+        pending.push((id, buf));
         *count = id;
         Ok(Fk(id))
     }
@@ -258,6 +260,12 @@ impl MultiList {
         let count = *self.count.lock().unwrap();
         if id == 0 || id > count {
             return Err(StoreError::NotFound);
+        }
+        {
+            let pending = self.pending.lock().unwrap();
+            if let Some((_, buf)) = pending.iter().rev().find(|(have, _)| *have == id) {
+                return Ok((Fk(le_u64!(buf, 0)), Fk(le_u64!(buf, 8))));
+            }
         }
         let mut buf = [0u8; MULTI_REC_LEN];
         self.file.read_at(Self::offset(id), &mut buf)?;
@@ -284,6 +292,32 @@ impl MultiList {
     #[doc(hidden)]
     pub fn contains(&self, head: Fk, target: Fk) -> Result<bool, StoreError> {
         Ok(self.collect(head)?.contains(&target))
+    }
+
+    /// Append the pending rows past the published end, then publish the length.
+    ///
+    /// Rows take consecutive ids, so they are one run. `commit_appends` makes
+    /// them durable before the length that names them, with no mark, so the
+    /// head mark armed after this never images `.mlt`. A failed commit
+    /// poisons `.mlt`: later inserts are refused until reopen.
+    fn commit_pending(&self) -> Result<(), StoreError> {
+        let mut pending = self.pending.lock().unwrap();
+        let Some((first, _)) = pending.first() else {
+            return Ok(());
+        };
+        let at = Self::offset(*first);
+        let bytes: Vec<u8> = pending
+            .iter()
+            .flat_map(|(_, buf)| buf.iter().copied())
+            .collect();
+        page_guard::commit_appends(&[page_guard::Append {
+            file: &self.file,
+            at,
+            bytes: &bytes,
+            new_logical: at + bytes.len() as u64,
+        }])?;
+        pending.clear();
+        Ok(())
     }
 
     #[doc(hidden)]
@@ -340,17 +374,12 @@ pub fn install_grown_oa(from: &Path, to: &Path) -> Result<(), StoreError> {
     }
 }
 
-const AHEAD_MAGIC: &[u8; 4] = b"HHA1";
-const AHEAD_VERSION: u16 = 1;
-const AHEAD_HEAD: usize = 12;
-const AHEAD_REC: usize = 8 + 32 + 4096;
-
 #[cfg(debug_assertions)]
 static FAIL_AHEAD: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
 #[cfg(debug_assertions)]
 static FAIL_SECOND_WRITE: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
 
-/// Leave the next ahead image for `path` behind and fail before the pwrite.
+/// Leave the next group mark for `path` behind and fail before the pwrite.
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub fn fail_next_hash_head_flush_after_ahead(path: &Path) {
@@ -386,130 +415,29 @@ fn take_fail_second_write(path: &Path) -> bool {
         .remove(path)
 }
 
-fn ahead_path(path: &Path) -> PathBuf {
-    let mut name = path
-        .file_name()
-        .unwrap_or_else(|| std::ffi::OsStr::new("hashhead"))
-        .to_os_string();
-    name.push(".ahead");
-    match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
-        _ => PathBuf::from(name),
-    }
-}
-
-fn parse_ahead_pages(raw: &[u8]) -> Result<BTreeMap<u64, [u8; 4096]>, StoreError> {
-    if raw.len() < AHEAD_HEAD || raw[0..4] != *AHEAD_MAGIC {
-        return Err(StoreError::Corrupt("hash head ahead header"));
-    }
-    if u16::from_le_bytes([raw[4], raw[5]]) != AHEAD_VERSION {
-        return Err(StoreError::Corrupt("hash head ahead version"));
-    }
-    let count = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]) as usize;
-    let payload = raw.len().saturating_sub(AHEAD_HEAD);
-    if !payload.is_multiple_of(AHEAD_REC) || payload / AHEAD_REC != count {
-        return Err(StoreError::Corrupt("hash head ahead length"));
-    }
-    let mut at = AHEAD_HEAD;
-    let mut images = BTreeMap::new();
-    for _ in 0..count {
-        if raw.len() < at + AHEAD_REC {
-            return Err(StoreError::Corrupt("hash head ahead short"));
-        }
-        let mut off_buf = [0u8; 8];
-        off_buf.copy_from_slice(&raw[at..at + 8]);
-        let off = u64::from_le_bytes(off_buf);
-        let sum = &raw[at + 8..at + 40];
-        let image = &raw[at + 40..at + AHEAD_REC];
-        if !off.is_multiple_of(4096) {
-            return Err(StoreError::Corrupt("hash head ahead offset"));
-        }
-        let mut eng = sha256::HashEngine::default();
-        eng.input(&off.to_le_bytes());
-        eng.input(image);
-        if sha256::Hash::from_engine(eng).to_byte_array() != *sum {
-            return Err(StoreError::Corrupt("hash head ahead checksum"));
-        }
-        let mut page = [0u8; 4096];
-        page.copy_from_slice(image);
-        images.insert(off, page);
-        at += AHEAD_REC;
-    }
-    if at != raw.len() {
-        return Err(StoreError::Corrupt("hash head ahead length"));
-    }
-    Ok(images)
-}
-
-fn load_ahead_pages(path: &Path) -> Result<BTreeMap<u64, [u8; 4096]>, StoreError> {
-    let side = ahead_path(path);
-    match std::fs::read(&side) {
-        Ok(raw) => parse_ahead_pages(&raw),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
-        Err(e) => Err(StoreError::io(&side, e)),
-    }
-}
-
-fn encode_ahead_pages(blocks: &BTreeMap<u64, [u8; 4096]>) -> Vec<u8> {
-    let mut buf = Vec::new();
-    buf.extend_from_slice(AHEAD_MAGIC);
-    buf.extend_from_slice(&AHEAD_VERSION.to_le_bytes());
-    buf.extend_from_slice(&0u16.to_le_bytes());
-    buf.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
-    for (off, image) in blocks {
-        buf.extend_from_slice(&off.to_le_bytes());
-        let mut eng = sha256::HashEngine::default();
-        eng.input(&off.to_le_bytes());
-        eng.input(image);
-        buf.extend_from_slice(&sha256::Hash::from_engine(eng).to_byte_array());
-        buf.extend_from_slice(image);
-    }
-    buf
-}
-
-/// Apply full 4 KiB page images left by an interrupted `SlotPageCache::flush`.
-///
-/// A dirty 3 KiB chunk can share a page with a clean neighbor. The image is
-/// the whole page, so restoring it also puts the neighbor back.
-fn restore_ahead(path: &Path) -> Result<(), StoreError> {
-    let side = ahead_path(path);
-    let raw = match std::fs::read(&side) {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(StoreError::io(&side, e)),
-    };
-    let images = parse_ahead_pages(&raw)?;
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .map_err(|e| StoreError::io(path, e))?;
-    for (off, image) in images {
-        file.seek(SeekFrom::Start(off))
-            .map_err(|e| StoreError::io(path, e))?;
-        file.write_all(&image)
-            .map_err(|e| StoreError::io(path, e))?;
-    }
-    file.durable_sync_all()
-        .map_err(|e| StoreError::io(path, e))?;
-    drop(file);
-    std::fs::remove_file(&side).map_err(|e| StoreError::io(&side, e))?;
-    if let Some(parent) = side.parent() {
-        file::fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
-    }
-    Ok(())
-}
-
-fn read_page(path: &Path, file: &TableFile, block: u64) -> Result<[u8; 4096], StoreError> {
-    let mut image = [0u8; 4096];
+fn read_page(path: &Path, file: &TableFile, block: u64) -> Result<[u8; PAGE as usize], StoreError> {
+    let mut image = [0u8; PAGE as usize];
     let len = std::fs::metadata(path)
         .map_err(|e| StoreError::io(path, e))?
         .len();
     if block < len {
-        let n = ((len - block) as usize).min(4096);
+        let n = ((len - block) as usize).min(PAGE as usize);
         file.pread_all(block, &mut image[..n])?;
     }
     Ok(image)
+}
+
+fn overlay_bytes(image: &mut [u8; PAGE as usize], page: u64, off: u64, bytes: &[u8]) {
+    let end = off.saturating_add(bytes.len() as u64);
+    let lo = off.max(page);
+    let hi = end.min(page + PAGE);
+    if lo >= hi {
+        return;
+    }
+    let src = (lo - off) as usize;
+    let dst = (lo - page) as usize;
+    let n = (hi - lo) as usize;
+    image[dst..dst + n].copy_from_slice(&bytes[src..src + n]);
 }
 
 impl HashHead {
@@ -527,6 +455,16 @@ impl HashHead {
         file.ensure_capacity(need)?;
         file.set_logical_len(need)?;
         file.zero_range(FILE_HEADER_LEN as u64, body_bytes)?;
+        // Each header is two pwrites, unordered without a sync. The first
+        // insert keeps the length, so its mark need not image page 0, and
+        // `.mlt` gets no sync until a row lands. Sync both, then their names,
+        // before any mark (`header.head` or the first `header.body` append)
+        // can arm over them: a restore recreates a lost name with only the
+        // imaged pages.
+        file.sync_data_only()?;
+        multi.file.sync_data_only()?;
+        let dir = head_dir(&path)?;
+        file::fsync_parent_dir(dir).map_err(|e| StoreError::io(dir, e))?;
         if slots > DEFAULT_SLOTS {
             rbitcoin_log::trace!(
                 Store,
@@ -545,7 +483,7 @@ impl HashHead {
 
     pub fn open(path: impl Into<std::path::PathBuf>) -> Result<Self, StoreError> {
         let path = path.into();
-        restore_ahead(&path)?;
+        page_guard::restore_store_group(head_dir(&path)?, page_guard::HEADER_HEAD_MARK)?;
         let file = TableFile::open(&path, TableKind::HashHead)?;
         let multi = MultiList::open(&path)?;
         let body = file.logical_len().saturating_sub(FILE_HEADER_LEN as u64);
@@ -811,9 +749,62 @@ impl HashHead {
             }
         }
 
-        self.file.write_at(FILE_HEADER_LEN as u64, &table)?;
+        self.persist_table_image(FILE_HEADER_LEN as u64, &table)?;
         self.state.lock().unwrap().occupied = occupied;
         Ok(())
+    }
+
+    /// Write a filled empty table at `offset`. The table on disk is all
+    /// zeros (a head only inserts), so only the pages that hold a non-zero
+    /// byte change: those are imaged and written, plus the page that holds
+    /// a new end.
+    fn persist_table_image(&self, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let old = self.file.logical_len();
+        let new_end = offset.saturating_add(bytes.len() as u64);
+        let mut pages = BTreeSet::new();
+        if new_end != old {
+            pages.insert(0u64);
+            pages.insert(((new_end - 1) / PAGE) * PAGE);
+        }
+        let first = (offset / PAGE) * PAGE;
+        let last = ((new_end - 1) / PAGE) * PAGE;
+        let span = |page: u64| {
+            let lo = page.max(offset);
+            let hi = (page + PAGE).min(new_end);
+            (lo, &bytes[(lo - offset) as usize..(hi - offset) as usize])
+        };
+        let mut page = first;
+        while page <= last {
+            if span(page).1.iter().any(|b| *b != 0) {
+                pages.insert(page);
+            }
+            page += PAGE;
+        }
+        let mut images = Vec::with_capacity(pages.len());
+        for &page in &pages {
+            let mut image = read_page(self.file.path(), &self.file, page)?;
+            if page == 0 {
+                image[..FILE_HEADER_LEN].copy_from_slice(&file::encode_leading_header(
+                    TableKind::HashHead,
+                    new_end.max(old),
+                ));
+            }
+            overlay_bytes(&mut image, page, offset, bytes);
+            images.push((page, image));
+        }
+        self.multi.commit_pending()?;
+        let _hold = page_guard::hold_marks();
+        self.arm_head_pages(&images)?;
+        for &page in &pages {
+            let (at, part) = span(page);
+            if !part.is_empty() {
+                self.file.write_at(at, part)?;
+            }
+        }
+        self.clear_head_mark()
     }
 
     /// Create a new OA file at `path`, reopening an existing `.mlt` if present.
@@ -906,6 +897,27 @@ impl HashHead {
         Self::open(&path)
     }
 
+    fn arm_head_pages(&self, head: &[(u64, [u8; PAGE as usize])]) -> Result<(), StoreError> {
+        if head.is_empty() {
+            return Ok(());
+        }
+        let dir = head_dir(self.file.path())?;
+        let head_name = page_guard::guard_file_name(self.file.path())?;
+        let refs: Vec<(&str, u64, &[u8])> = head
+            .iter()
+            .map(|(off, image)| (head_name, *off, image.as_slice()))
+            .collect();
+        page_guard::arm_store_group(dir, page_guard::HEADER_HEAD_MARK, &refs)
+    }
+
+    fn clear_head_mark(&self) -> Result<(), StoreError> {
+        let dir = head_dir(self.file.path())?;
+        page_guard::clear_page_guard_files(
+            &dir.join(page_guard::HEADER_HEAD_MARK),
+            &[(&self.file.read_file, self.file.path())],
+        )
+    }
+
     pub fn flush(&self) -> Result<(), StoreError> {
         self.multi.flush()?;
         self.file.flush()
@@ -914,6 +926,15 @@ impl HashHead {
     pub fn flush_async(&self) -> Result<(), StoreError> {
         self.multi.flush_async()?;
         self.file.flush_async()
+    }
+}
+
+/// Directory that holds `path` and `guard/header.head`. A bare file name
+/// has none, so open, arm, and clear all refuse it the same way.
+fn head_dir(path: &std::path::Path) -> Result<&std::path::Path, StoreError> {
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => Ok(dir),
+        _ => Err(StoreError::Rejected("page guard mark has no directory")),
     }
 }
 
@@ -1054,41 +1075,30 @@ impl<'a> SlotPageCache<'a> {
 
     #[doc(hidden)]
     pub fn flush(&mut self) -> Result<(), StoreError> {
-        let mut blocks: BTreeMap<u64, [u8; 4096]> = BTreeMap::new();
+        let mut blocks: BTreeMap<u64, [u8; PAGE as usize]> = BTreeMap::new();
         for chunk in self.chunks.values().filter(|chunk| chunk.dirty) {
             let off = HashHead::slot_file_off(chunk.base_slot);
             let len = chunk.data.len() as u64;
-            let first = off & !4095;
-            let last = (off + len - 1) & !4095;
+            let first = (off / PAGE) * PAGE;
+            let last = ((off + len - 1) / PAGE) * PAGE;
             let mut block = first;
             while block <= last {
                 if let std::collections::btree_map::Entry::Vacant(entry) = blocks.entry(block) {
                     entry.insert(read_page(self.head.file.path(), &self.head.file, block)?);
                 }
                 let Some(image) = blocks.get_mut(&block) else {
-                    block += 4096;
+                    block += PAGE;
                     continue;
                 };
-                let lo = off.max(block);
-                let hi = (off + len).min(block + 4096);
-                let src = (lo - off) as usize;
-                let dst = (lo - block) as usize;
-                image[dst..dst + (hi - lo) as usize]
-                    .copy_from_slice(&chunk.data[src..src + (hi - lo) as usize]);
-                block += 4096;
+                overlay_bytes(image, block, off, &chunk.data);
+                block += PAGE;
             }
         }
-        let side = if blocks.is_empty() {
-            None
-        } else {
-            // A leftover sidecar from a failed write keeps pages this write
-            // does not replace; new images win on pages they cover.
-            let mut merged = load_ahead_pages(self.head.file.path())?;
-            merged.extend(blocks);
-            let buf = encode_ahead_pages(&merged);
-            self.head.multi.flush()?;
-            let side = ahead_path(self.head.file.path());
-            file::write_synced_tmp_rename(&side, &buf)?;
+        self.head.multi.commit_pending()?;
+        let head_pages: Vec<(u64, [u8; PAGE as usize])> = blocks.into_iter().collect();
+        if !head_pages.is_empty() {
+            let _hold = page_guard::hold_marks();
+            self.head.arm_head_pages(&head_pages)?;
             #[cfg(debug_assertions)]
             if take_fail_ahead(self.head.file.path()) {
                 return Err(StoreError::io(
@@ -1096,34 +1106,24 @@ impl<'a> SlotPageCache<'a> {
                     std::io::Error::other("injected hash head ahead failure"),
                 ));
             }
-            Some(side)
-        };
-        // BTreeMap iterates in chunk/slot order → sequential writeback (map or pwrite).
-        let mut writes = 0u32;
-        for (_, chunk) in self.chunks.iter_mut() {
-            if chunk.dirty {
-                let off = HashHead::slot_file_off(chunk.base_slot);
-                self.head.file.write_at(off, &chunk.data)?;
-                writes = writes.saturating_add(1);
-                #[cfg(debug_assertions)]
-                if writes >= 2 && take_fail_second_write(self.head.file.path()) {
-                    return Err(StoreError::io(
-                        self.head.file.path(),
-                        std::io::Error::other("injected hash head second-write failure"),
-                    ));
+            let mut writes = 0u32;
+            for (_, chunk) in self.chunks.iter_mut() {
+                if chunk.dirty {
+                    let off = HashHead::slot_file_off(chunk.base_slot);
+                    self.head.file.write_at(off, &chunk.data)?;
+                    writes = writes.saturating_add(1);
+                    #[cfg(debug_assertions)]
+                    if writes >= 2 && take_fail_second_write(self.head.file.path()) {
+                        return Err(StoreError::io(
+                            self.head.file.path(),
+                            std::io::Error::other("injected hash head second-write failure"),
+                        ));
+                    }
                 }
             }
-        }
-        if side.is_some() {
-            self.head.file.sync_data_only()?;
+            self.head.clear_head_mark()?;
         }
         self.chunks.clear();
-        if let Some(side) = side {
-            std::fs::remove_file(&side).map_err(|e| StoreError::io(&side, e))?;
-            if let Some(parent) = side.parent() {
-                file::fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
-            }
-        }
         Ok(())
     }
 }

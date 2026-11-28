@@ -177,6 +177,40 @@ fn a_failed_slots_rename_keeps_later_removals() {
     assert!(mp.get_tx(&txs[3].compute_txid()).is_none());
 }
 
+/// After a failed slots rename, slot writes go to `slots.tmp`, so a flush
+/// mark armed then names `slots.tmp`. Open must apply that mark before it
+/// links `slots.tmp` into place, or the images land on a fresh file and the
+/// removal they publish is lost.
+#[cfg(debug_assertions)]
+#[test]
+fn open_applies_a_slots_tmp_mark_before_linking_it() {
+    let dir = tmp_dir();
+    let (ops, utxos) = chain_coins(4);
+    let mut mp = ActiveMempool::open_or_create(dir.path()).unwrap();
+    let txs: Vec<_> = ops.iter().map(|op| spend(*op, 99_000)).collect();
+    for tx in &txs {
+        mp.accept_tx(tx, &utxos, TIP_OK).expect("admit");
+    }
+    mp.flush().unwrap();
+    let slots = dir.path().join("slots");
+    fs::remove_file(&slots).unwrap();
+    fs::create_dir(&slots).unwrap();
+    assert!(mp.compact().is_err());
+    // The removal's death mark is armed and then its pages are never written.
+    rbitcoin_mempool::store::fail_next_mempool_guard_before_write(dir.path());
+    assert!(mp.remove_txid(&txs[3].compute_txid(), BLOCK).is_err());
+    assert!(dir.path().join("guard/flush").is_file());
+    fs::remove_dir(&slots).unwrap();
+    // The process dies here: nothing flushes on the way out.
+    std::mem::forget(mp);
+    let mp = ActiveMempool::open_or_create(dir.path()).unwrap();
+    assert!(
+        mp.get_tx(&txs[3].compute_txid()).is_none(),
+        "the removal in the slots.tmp mark was lost"
+    );
+    assert_eq!(mp.live_count(), 3);
+}
+
 fn out0(tx: &Transaction) -> OutPoint {
     OutPoint {
         txid: tx.compute_txid(),
@@ -239,9 +273,8 @@ fn a_replaced_conflict_and_its_descendant_name_the_replacement() {
     );
 }
 
-/// A full pool of durable chunks pays one death sync per budget pass, and
-/// that sync publishes the final count before the pass returns. `meta` is
-/// reopened for append, so each sync adds one record to its file.
+/// A full pool of durable chunks pays one death flush per budget pass, and
+/// that flush publishes the final count before the pass returns.
 #[test]
 fn a_budget_pass_syncs_its_deaths_once() {
     use rbitcoin_mempool::store::{write_meta_bytes, META_LEN};
@@ -255,22 +288,31 @@ fn a_budget_pass_syncs_its_deaths_once() {
     }
     mp.store.flush().unwrap();
     let meta = dir.path().join("meta");
-    let before = std::fs::read(&meta).unwrap().len();
-    mp.store.meta_file = std::fs::OpenOptions::new()
-        .append(true)
-        .open(&meta)
-        .unwrap();
 
     mp.max_weight = 0;
+    #[cfg(all(unix, debug_assertions))]
+    rbitcoin_store::file::arm_fsync_dir_trace();
     assert_eq!(mp.evict_to_budget(None).unwrap().len(), 4, "four chunks");
+    // One mark publish and one clear each sync guard/. Four evictions that
+    // each flushed would sync it eight times.
+    #[cfg(all(unix, debug_assertions))]
+    {
+        let guard = dir.path().join("guard");
+        let syncs = rbitcoin_store::file::take_fsynced_dirs()
+            .into_iter()
+            .filter(|d| *d == guard)
+            .count();
+        assert_eq!(syncs, 2, "one guard/flush publish and one clear per pass");
+    }
 
-    let synced = std::fs::read(&meta).unwrap()[before..].to_vec();
-    let records: Vec<&[u8]> = synced.chunks(META_LEN).collect();
-    assert_eq!(records.len(), 1, "death syncs in one budget pass");
+    let raw = std::fs::read(&meta).unwrap();
+    let mut got = [0u8; META_LEN];
+    got.copy_from_slice(&raw[..META_LEN]);
     let mut want = [0u8; META_LEN];
     let m = mp.store.meta();
     write_meta_bytes(&mut want, m.generation, m.slot_cap, 0);
-    assert_eq!(records[0], want, "the sync publishes the final count");
+    assert_eq!(got, want, "the flush publishes the final count");
+    assert!(!dir.path().join("guard/flush").exists());
 }
 
 #[test]

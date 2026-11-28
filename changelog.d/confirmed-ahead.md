@@ -6,8 +6,8 @@ Fixed
   could leave that null run untrimmed and shrink the tip onto a null slot.
   A null below the revalidation window was skipped by the height fence, and
   open then cleared the strong bits of that block's transactions. The flush
-  now writes a synced `confirmed.body.ahead` image first and open restores
-  it. Open clamps to the seal, compares the sealed hash, then trims null
+  now arms a synced page-guard mark of those pages first and open restores
+  it (`class-c-guard.md`). Open clamps to the seal, compares the sealed hash, then trims null
   slots. Before it builds the fence it cuts the tip below a null in the
   block that holds the sealed tip (a crash under an older binary) and
   refuses a null anywhere else. An array flush images page 0 even when a

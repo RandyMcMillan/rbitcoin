@@ -17,8 +17,8 @@ REQUIRED=(
   windows
   macos
   coverage
-  pread
-  rust-forward
+  pread-release
+  toolchains
 )
 
 usage() {

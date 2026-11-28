@@ -559,3 +559,67 @@ fn cache_eviction_leaves_one_wave_in_the_ahead_image() {
     let _ = std::fs::remove_file(&ahead);
     let _ = std::fs::remove_file(occ_sidecar_path(&path));
 }
+
+/// A fill of an empty table writes each run of adjacent slots once, not
+/// one write per 24-byte slot. Every key reads back.
+#[cfg(debug_assertions)]
+#[test]
+fn bulk_fill_writes_each_run_of_adjacent_slots_once() {
+    use rbitcoin_store::file::{arm_write_trace, take_write_trace, TracedWrite};
+    use rbitcoin_store::scripthash_layout::{ShHeadKey, SH_HEAD_KEY_LEN};
+    let dir = rbitcoin_store::testutil::TempDir::labeled("shhead-runs").unwrap();
+    let path = dir.path.join("head");
+    let slots = 64u64;
+    let h = ScriptHashHead::create_with_slots(&path, slots).unwrap();
+    let entries: Vec<(ShHeadKey, ShHeadValue)> = (0u64..40)
+        .map(|i| {
+            let mut full = [0u8; 32];
+            full[..8].copy_from_slice(&i.wrapping_mul(0x9e37_79b9_7f4a_7c15).to_le_bytes());
+            full[8] = 1;
+            (
+                ScriptHashHead::to_key(&full),
+                ShHeadValue::inline_one(Fk(i + 1)),
+            )
+        })
+        .collect();
+    let keys: Vec<ShHeadKey> = entries.iter().map(|(k, _)| *k).collect();
+    let mut assigned = ScriptHashHead::assign_empty_slots(slots, &keys).unwrap();
+    assigned.sort_unstable();
+    assigned.dedup();
+    // Each run of adjacent slots is one expected (offset, len) write.
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    for (i, slot) in assigned.iter().enumerate() {
+        if i > 0 && assigned[i - 1] + 1 == *slot {
+            runs.last_mut().unwrap().1 += SH_HEAD_SLOT_SIZE as u64;
+        } else {
+            runs.push((
+                ScriptHashHead::slot_file_off(*slot),
+                SH_HEAD_SLOT_SIZE as u64,
+            ));
+        }
+    }
+    assert!(
+        runs.len() < assigned.len(),
+        "the fixture has no adjacent slots"
+    );
+    arm_write_trace();
+    h.bulk_fill_empty(&entries).unwrap();
+    let mut slot_writes: Vec<(u64, u64)> = take_write_trace()
+        .into_iter()
+        .filter_map(|w| match w {
+            TracedWrite::Write {
+                path: p,
+                offset,
+                len,
+            } if p == path && offset >= FILE_HEADER_LEN as u64 => Some((offset, len)),
+            _ => None,
+        })
+        .collect();
+    slot_writes.sort_unstable();
+    assert_eq!(slot_writes, runs);
+    for (i, (key, val)) in entries.iter().enumerate() {
+        let mut full = [0u8; 32];
+        full[..SH_HEAD_KEY_LEN].copy_from_slice(key);
+        assert_eq!(h.get(&full).unwrap().as_ref(), Some(val), "key {i}");
+    }
+}

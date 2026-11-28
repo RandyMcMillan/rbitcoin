@@ -21,8 +21,7 @@ pub mod block_wire;
 pub mod bulk_io;
 #[doc(hidden)]
 pub mod chain;
-#[doc(hidden)]
-pub mod class_a_pages;
+mod class_a_legacy;
 #[doc(hidden)]
 pub mod compact;
 #[doc(hidden)]
@@ -72,6 +71,8 @@ pub mod io_session_pool;
 pub mod loc_table;
 #[doc(hidden)]
 pub mod open_address;
+#[doc(hidden)]
+pub mod page_guard;
 #[doc(hidden)]
 pub mod point_table;
 #[doc(hidden)]
@@ -132,6 +133,9 @@ pub mod txstat;
 pub mod uring_session;
 #[doc(hidden)]
 pub mod var_table;
+#[cfg(feature = "write-probe")]
+#[doc(hidden)]
+pub mod write_probe;
 
 pub use crate::array_table::ClassCWrite;
 #[cfg(debug_assertions)]
@@ -139,6 +143,9 @@ pub use crate::array_table::ClassCWrite;
 pub use crate::array_table::{bind_tip_flush_hold, TipFlushHold};
 pub use crate::chain::HeaderTxsTable;
 pub use crate::compact::output_flags;
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub use crate::header_table::bind_header_flush_hold;
 pub use address_head::{is_probe_exhausted_error, is_store_corrupt_display};
 pub use block_filter::{BlockFilterRecord, BlockFilterSlot, BlockFilterTable, StoredBlockFilter};
 pub use block_queue::{BlockQueue, QueuedBlockMeta, TakenRaw};

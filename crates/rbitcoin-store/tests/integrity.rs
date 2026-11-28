@@ -860,8 +860,14 @@ fn failed_header_write_stops_class_a(
     s.checkpoint_spend_through(0).unwrap();
     s.set_prune_seqsigwit_mode(prune);
     let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writers_at_fail = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let seen = std::sync::Arc::clone(&fired);
+    let counted = std::sync::Arc::clone(&writers_at_fail);
     s.txs.on_class_a_failure(move || {
+        counted.store(
+            rbitcoin_store::testutil::class_a_writers_at_last_failure(),
+            std::sync::atomic::Ordering::SeqCst,
+        );
         seen.store(true, std::sync::atomic::Ordering::SeqCst);
     });
 
@@ -874,6 +880,10 @@ fn failed_header_write_stops_class_a(
     );
     drop(disarm);
     assert!(fired.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(
+        writers_at_fail.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "the failure hook ran after the writer count dropped, so a sync can clear the mark"
+    );
     assert!(
         s.flush_class_c_tip().is_err(),
         "the barrier ran after a failed write"
@@ -1265,6 +1275,75 @@ fn class_a_sync_failure_stops_the_class_c_commit() {
             on_disk_hwm(&dir.join("confirmed.body")),
             sealed,
             "{name}: confirmed[] reached disk ahead of Class A"
+        );
+        drop(s);
+        let s = Store::open_tiny(&dir).unwrap();
+        assert_eq!(s.confirmed.tip_height(), Some(Height(0)), "{name}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A failed step of the shutdown flush does not skip the steps after it. A
+/// dirty scripthash index costs a full rebuild at the next start, so it syncs
+/// and clears its mark first, even when the tip seal then fails. The seal is
+/// skipped over a failed header sync: a retried fsync can return 0 over
+/// dropped pages (#2138).
+#[test]
+fn a_failed_shutdown_step_still_syncs_a_dirty_scripthash_index() {
+    use rbitcoin_store::io_handle::{arm_fail_flush, arm_fail_sync, IoHandle};
+    type Arm = fn(IoHandle, u32);
+    let header_body: ClassAPick = |s| s.headers.body.io_handle();
+    for (name, pick, arm, seal) in [
+        ("headers.body", header_body, arm_fail_flush as Arm, true),
+        (
+            CLASS_A_FILES[0].0,
+            CLASS_A_FILES[0].1,
+            arm_fail_sync as Arm,
+            true,
+        ),
+        ("no seal", header_body, arm_fail_flush as Arm, false),
+    ] {
+        let dir = tmp();
+        let s = Store::create_tiny(&dir).unwrap();
+        let write = rbitcoin_store::ClassCWrite::for_test();
+        let (genesis, parent) = connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+        s.flush_class_c_tip().unwrap();
+        let sealed = on_disk_hwm(&dir.join("confirmed.body"));
+        connect_coinbase(&s, &write, 1, genesis, parent);
+        drop(s.scripthash.begin_dirty_write().unwrap());
+        let marker = dir.join(rbitcoin_store::scripthash::SH_DIRTY_NAME);
+        assert!(marker.exists(), "{name}");
+        if seal {
+            if name == "headers.body" {
+                // A put leaves the body synced. Republish its length so the
+                // shutdown flush has a sync to fail, as after a failed put.
+                let body = &s.headers.body;
+                body.set_logical_len(body.logical_len()).unwrap();
+            }
+            arm(pick(&s), 1);
+        }
+        rbitcoin_log::capture_logs(true);
+        let flushed = s.flush_for_shutdown(seal);
+        let lines = rbitcoin_log::take_logs();
+        rbitcoin_log::capture_logs(false);
+        assert_eq!(flushed.is_err(), seal, "{name}: only a failed step errs");
+        assert!(!marker.exists(), "{name}: the scripthash sync was skipped");
+        assert_eq!(
+            on_disk_hwm(&dir.join("confirmed.body")),
+            sealed,
+            "{name}: the tip was sealed past a failed prerequisite"
+        );
+        let step = |what: &str| {
+            lines
+                .iter()
+                .position(|(_, l)| l.contains("shutdown flush") && l.contains(what))
+                .unwrap_or_else(|| panic!("{name}: no `{what}` step in {lines:?}"))
+        };
+        assert!(step("scripthash") < step("tip seal"), "{name}: {lines:?}");
+        assert!(step("tip seal") < step("Class A writeback"), "{name}");
+        assert!(
+            step("Class A writeback") < step("tx.head snapshot"),
+            "{name}"
         );
         drop(s);
         let s = Store::open_tiny(&dir).unwrap();
@@ -1677,6 +1756,52 @@ fn every_torn_txstat_stamp_reads_unstamped_and_restamps() {
     }
     let _ = std::fs::remove_dir_all(&img);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A stats stamp syncs `txstat` files the Class A barrier syncs. A failed
+/// sync there latches Class A as a barrier's does: a retried fsync can
+/// succeed after the kernel dropped the dirty pages, and the failed one may
+/// have taken an append's writeback error. A stamp the store refuses (a
+/// create past the count) is not a failed sync and does not latch.
+#[test]
+fn failed_txstat_stamp_sync_latches_class_a() {
+    let picks: [(&str, ClassAPick); 3] = [
+        ("txstat.body", |s| s.txs.txstat.body.io_handle()),
+        ("txstat.ovf", |s| s.txs.txstat.ovf.io_handle()),
+        ("txstat.blk", |s| s.txs.txstat.blk.io_handle()),
+    ];
+    for (name, pick) in picks {
+        let dir = tmp();
+        let s = Store::create_tiny(&dir).unwrap();
+        let write = rbitcoin_store::ClassCWrite::for_test();
+        let (genesis, parent) = connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+        let (h1, _) = connect_coinbase(&s, &write, 1, genesis, parent);
+        assert_eq!(s.flush_class_c_tip().unwrap(), Some(Height(1)));
+        let fk = s.header_txs.get_list(h1).unwrap().unwrap()[0];
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = std::sync::Arc::clone(&fired);
+        s.txs.on_class_a_failure(move || {
+            seen.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let wide = wide_txstat();
+        assert!(s.write_txstat_block(h1, fk.0 + 10, &[wide]).is_err());
+        assert!(!fired.load(std::sync::atomic::Ordering::SeqCst), "{name}");
+        s.txs.sync_class_a_data().unwrap();
+
+        rbitcoin_store::io_handle::arm_fail_sync(pick(&s), 1);
+        assert!(
+            s.write_txstat_block(h1, fk.0, &[wide]).is_err(),
+            "{name}: the stamp did not sync it"
+        );
+        assert!(fired.load(std::sync::atomic::Ordering::SeqCst), "{name}");
+        assert!(
+            s.txs.sync_class_a_data().is_err(),
+            "{name}: a barrier synced over a failed stamp sync"
+        );
+        assert!(s.write_txstat_block(h1, fk.0, &[wide]).is_err(), "{name}");
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// A create open keeps past the committed floor can carry a stamped cell

@@ -534,8 +534,7 @@ fn publish_archived_header_ranges(
     let write = rbitcoin_store::ClassCWrite::new();
     query
         .store
-        .header_txs
-        .put_ranges_batch(&write, ranges)
+        .put_header_ranges(&write, ranges)
         .map_err(ConfirmError::from)
 }
 

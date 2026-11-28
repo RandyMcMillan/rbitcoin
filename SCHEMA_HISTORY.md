@@ -1,7 +1,7 @@
 # Schema history
 
 Historic on-disk layouts for the rbitcoin chain store.  
-**Current layout:** [`SCHEMA.md`](./SCHEMA.md) (`SCHEMA_VERSION = 30`).
+**Current layout:** [`SCHEMA.md`](./SCHEMA.md) (`SCHEMA_VERSION = 31`).
 
 Until 1.0 there is **no in-place migration**: a new major layout generally means wipe the store and redo IBD. This file is for archaeology, code archaeology, and understanding why the current design looks the way it does.
 
@@ -13,7 +13,8 @@ Versions below are listed **newest → oldest** after the summary table.
 
 | Version | Headline change | Still in current tree as… |
 |--------:|-----------------|---------------------------|
-| **30** | `spent.delta/` records every spend: segments of page records, a directory base plus a log, and a commit. `spent.body` is sparse; only a fold writes it. Open adopts a 29 `spent.body` and page log as the first delta generation. A 29 binary refuses 30 `meta`. | **Current** |
+| **31** | A page-guard mark may exist under `store/guard/`. No table rewrite. Open rewrites 22–30 `meta` to 31. A 30 binary refuses 31 `meta`. | **Current** |
+| **30** | `spent.delta/` records every spend: segments of page records, a directory base plus a log, and a commit. `spent.body` is sparse; only a fold writes it. Open adopts a 29 `spent.body` and page log as the first delta generation. A 29 binary refuses 30 `meta`. | superseded by 31 |
 | **29** | Each `spend.pages` record names the generation file that holds that image. An unchanged page stays in the older file. A 28 binary would read every offset as the newest file, so it refuses 29 `meta`. Open rewrites 22–28 `meta` to 29. | superseded by 30 |
 | **28** | `meta` only. A 27 binary does not read `spend.pages` and would hide spends it wrote into `spent.body` under a live log, so it refuses 28 `meta`. A 28 binary rewrote 22–27 `meta` to 28. | Prior |
 | **27** | `meta` only. A pruned witness stem can be a header while creates remain. A 26 binary would truncate that chain, so it refuses 27 `meta`. Open rewrites 22–26 `meta` to 27, pruned or not. | Prior |
@@ -43,6 +44,10 @@ Versions below are listed **newest → oldest** after the summary table.
 | **≤3** | Early mmap store; fat heads; mixed prev encoding | Mostly gone |
 
 ---
+
+## v31 (page-guard marks)
+
+No table changes shape. 31 means a page-guard mark may exist under `store/guard/`. Open rewrites 22–30 `meta` to 31, and a new store is created at 31. Files keep the stamp they were written with. A 30 binary refuses 31 `meta`, so it never opens a store with a mark it would ignore.
 
 ## v30 (spend delta overlay)
 

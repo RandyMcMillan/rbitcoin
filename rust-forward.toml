@@ -1,4 +1,4 @@
-# Forward compiler for CI job `rust-forward`. Product MSRV stays
+# Forward compiler for the CI job `toolchains`. Product MSRV stays
 # rust-toolchain.toml. This channel is the newest rustc the tree is held to.
 # Later pulls move the channel and fix what that compiler names.
 [toolchain]

@@ -101,6 +101,113 @@ fn schema2_converts_on_open_with_unknown_sigops() {
     assert_eq!(mp.load_live_txs().unwrap()[0].packed.sigop_cost, Some(12));
 }
 
+/// Move the one live record of a closed pool so it starts at body offset `to`.
+fn move_only_record(dir: &Path, to: usize) {
+    let mut slots = fs::read(dir.join("slots")).unwrap();
+    let body = fs::read(dir.join("tx.body")).unwrap();
+    let off = SLOTS_HEADER;
+    assert_eq!(slots[off], SLOT_LIVE);
+    let b_off = u64::from_le_bytes(slots[off + 4..off + 12].try_into().unwrap()) as usize;
+    let b_len = u32::from_le_bytes(slots[off + 12..off + 16].try_into().unwrap()) as usize;
+    assert!(to >= b_off);
+    let mut new_body = body[..b_off].to_vec();
+    new_body.resize(to, 0);
+    new_body.extend_from_slice(&body[b_off..b_off + b_len]);
+    let len = new_body.len() as u64;
+    new_body[8..16].copy_from_slice(&len.to_le_bytes());
+    slots[off + 4..off + 12].copy_from_slice(&(to as u64).to_le_bytes());
+    fs::write(dir.join("tx.body"), new_body).unwrap();
+    fs::write(dir.join("slots"), slots).unwrap();
+}
+
+/// A schema-2 pool whose one LIVE record has its sigop cost crossing the
+/// sector boundary at 512, unknown on disk (0xFF). Returns the txid.
+fn cross_sector_sigop_pool(dir: &Path) -> Txid {
+    let tx = tiny_tx();
+    let tid = tx.compute_txid();
+    {
+        let mut mp = Mempool::open_or_create(dir).unwrap();
+        mp.append_live_tx(
+            &tx,
+            &tid,
+            &tx.compute_wtxid(),
+            55,
+            400,
+            12,
+            1_700_000_000,
+            &[],
+        )
+        .unwrap();
+        mp.flush().unwrap();
+    }
+    downgrade_to_schema2(dir);
+    let record = 510 - SIGOP_COST_OFF;
+    let mp = Mempool::open_or_create(dir).unwrap();
+    let live = mp.load_live_txs().unwrap();
+    assert_eq!(live[0].packed.sigop_cost, None);
+    drop(mp);
+    move_only_record(dir, record);
+    tid
+}
+
+/// A recomputed cost whose 8 bytes cross a 512-byte sector is written low
+/// sector first, synced, then high sector. The cost is durable, and the one
+/// crash state between the two writes decodes as unknown.
+#[test]
+fn a_sigop_cost_across_a_sector_is_written_low_sector_first() {
+    let dir = tmp_dir();
+    let tid = cross_sector_sigop_pool(&dir);
+    let mut mp = Mempool::open_or_create(&dir).unwrap();
+    let live = mp.load_live_txs().unwrap();
+    assert_eq!(live[0].packed.txid, tid);
+    mp.set_sigop_cost(live[0].slot, 0x0400).unwrap();
+    assert_eq!(
+        mp.load_live_txs().unwrap()[0].packed.sigop_cost,
+        Some(0x0400)
+    );
+    drop(mp);
+    let body = fs::read(dir.join("tx.body")).unwrap();
+    assert_eq!(&body[510..518], &0x0400u64.to_le_bytes());
+    let mp = Mempool::open_or_create(&dir).unwrap();
+    assert_eq!(
+        mp.load_live_txs().unwrap()[0].packed.sigop_cost,
+        Some(0x0400)
+    );
+    drop(mp);
+    // A crash after the low sector: new low bytes under the old 0xFF high
+    // bytes decode above the block limit, so the cost reads unknown.
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(dir.join("tx.body"))
+        .unwrap();
+    file.seek(SeekFrom::Start(512)).unwrap();
+    file.write_all(&[0xFFu8; 6]).unwrap();
+    drop(file);
+    let mp = Mempool::open_or_create(&dir).unwrap();
+    assert_eq!(mp.load_live_txs().unwrap()[0].packed.sigop_cost, None);
+}
+
+/// The sync between the two sector writes is the barrier. When it fails,
+/// the high bytes are still the old 0xFF, so the cost reads unknown, not a
+/// mix of new low bytes and a new high byte.
+#[cfg(debug_assertions)]
+#[test]
+fn a_failed_sigop_sync_leaves_the_high_sector_old() {
+    let dir = tmp_dir();
+    let tid = cross_sector_sigop_pool(&dir);
+    let mut mp = Mempool::open_or_create(&dir).unwrap();
+    let live = mp.load_live_txs().unwrap();
+    assert_eq!(live[0].packed.txid, tid);
+    rbitcoin_mempool::store::set_mempool_sigop_sync_fails(&dir, true);
+    assert!(mp.set_sigop_cost(live[0].slot, 0x0400).is_err());
+    rbitcoin_mempool::store::set_mempool_sigop_sync_fails(&dir, false);
+    drop(mp);
+    let body = fs::read(dir.join("tx.body")).unwrap();
+    assert_eq!(&body[512..518], &[0xFFu8; 6], "the high sector was written");
+    let mp = Mempool::open_or_create(&dir).unwrap();
+    assert_eq!(mp.load_live_txs().unwrap()[0].packed.sigop_cost, None);
+}
+
 /// Schema 3 records keep fee, weight, sigops and vin aux, and get the
 /// migrate's wall-clock second as their accept time.
 #[test]
@@ -231,6 +338,28 @@ fn new_meta_is_published_through_a_synced_rename() {
     assert!(
         synced.iter().any(|d| d == dir.path()),
         "mempool meta name not synced: {synced:?}"
+    );
+}
+
+/// A new `slots` or `tx.body` is the durable base later marks patch, so its
+/// bytes and its directory entry are synced before open returns it.
+#[cfg(all(unix, debug_assertions))]
+#[test]
+fn new_slots_and_body_names_are_synced() {
+    let dir = tmp_dir();
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    let _ = open_or_init_slots(&dir.join("slots"), 4).unwrap();
+    let synced = rbitcoin_store::file::take_fsynced_dirs();
+    assert!(
+        synced.iter().any(|d| d == dir.path()),
+        "mempool slots name not synced: {synced:?}"
+    );
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    let _ = open_or_init_body(&dir.join("tx.body")).unwrap();
+    let synced = rbitcoin_store::file::take_fsynced_dirs();
+    assert!(
+        synced.iter().any(|d| d == dir.path()),
+        "mempool tx.body name not synced: {synced:?}"
     );
 }
 
@@ -413,6 +542,532 @@ fn dead_pwrite_of_flushed_slot_is_immediate() {
 }
 
 #[test]
+fn reused_dead_slot_sync_does_not_resurrect_the_old_tx() {
+    let dir = tmp_dir();
+    let old = Txid::from_byte_array([0xA1; 32]);
+    let new = Txid::from_byte_array([0xA2; 32]);
+    {
+        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        let slot = put_live(&mut mp, &old, 1, 400);
+        mp.flush().unwrap();
+        mp.mark_slot_dead(slot).unwrap();
+        let reused = put_live(&mut mp, &new, 2, 400);
+        assert_eq!(reused, slot, "a dead slot is reused");
+        mp.sync_deaths().unwrap();
+    }
+    let mp = Mempool::open_or_create(&dir).unwrap();
+    let live = mp.load_live_txs().unwrap();
+    assert!(
+        live.iter().all(|tx| tx.packed.txid != old),
+        "the evicted tx must not reload"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn slot_growth_commit_does_not_stamp_the_replacement_dead() {
+    let dir = tmp_dir();
+    let old = Txid::from_byte_array([0xE1; 32]);
+    let new = Txid::from_byte_array([0xE2; 32]);
+    let extra = Txid::from_byte_array([0xE3; 32]);
+    {
+        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        mp.testing_set_slot_cap(1);
+        let slot = put_live(&mut mp, &old, 1, 400);
+        mp.flush().unwrap();
+        mp.mark_slot_dead(slot).unwrap();
+        let reused = put_live(&mut mp, &new, 2, 400);
+        assert_eq!(reused, slot, "the dead slot is reused");
+        let grown = put_live(&mut mp, &extra, 3, 400);
+        assert_ne!(grown, slot, "a full live table grows a new slot");
+        mp.sync_deaths().unwrap();
+    }
+    let mp = Mempool::open_or_create(&dir).unwrap();
+    let ids: Vec<_> = mp
+        .load_live_txs()
+        .unwrap()
+        .iter()
+        .map(|tx| tx.packed.txid)
+        .collect();
+    assert!(
+        ids.contains(&new),
+        "the growth commit must not leave a death on the reused slot"
+    );
+    assert!(!ids.contains(&old));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn truncated_flush_mark_is_quarantined_with_the_sidecar() {
+    let dir = tmp_dir();
+    {
+        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        put_live(&mut mp, &Txid::from_byte_array([0xF1; 32]), 1, 400);
+        mp.flush().unwrap();
+    }
+    fs::write(dir.join("fee_history"), b"keep").unwrap();
+    fs::create_dir_all(dir.join("guard")).unwrap();
+    fs::write(dir.join("guard/flush"), b"torn").unwrap();
+    rbitcoin_mempool::ActiveMempool::open_or_create(&dir)
+        .expect("a torn flush mark is quarantined with the sidecar");
+    assert!(!dir.join("guard/flush").exists());
+    assert!(dir.join("fee_history").is_file());
+    let torn = fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|ent| ent.ok())
+        .find(|ent| ent.file_name().to_string_lossy().starts_with("torn-"))
+        .expect("the unreadable mark moves aside with the sidecar")
+        .path();
+    assert_eq!(
+        fs::read(torn.join("guard/flush")).unwrap(),
+        b"torn",
+        "the quarantine keeps the unreadable mark as it was"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A full flush that commits B in A's reused slot retires A's queued death,
+/// even when the `tx.body` trim after the commit fails. A later death sync
+/// must not stamp DEAD over B.
+#[cfg(debug_assertions)]
+#[test]
+fn a_committed_full_flush_retires_queued_deaths() {
+    use rbitcoin_mempool::store::fail_next_mempool_body_adopt;
+    let dir = tmp_dir();
+    let old = Txid::from_byte_array([0xC1; 32]);
+    let new = Txid::from_byte_array([0xC2; 32]);
+    {
+        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        mp.set_now_ms(0);
+        let slot = put_live(&mut mp, &old, 1, 400);
+        mp.flush().unwrap();
+        mp.mark_slot_dead(slot).unwrap();
+        let reused = put_live(&mut mp, &new, 2, 400);
+        assert_eq!(reused, slot);
+        fail_next_mempool_body_adopt(&dir);
+        assert!(mp.flush().is_err());
+        mp.sync_deaths().unwrap();
+    }
+    let mp = Mempool::open_or_create(&dir).unwrap();
+    let ids: Vec<_> = mp
+        .load_live_txs()
+        .unwrap()
+        .iter()
+        .map(|tx| tx.packed.txid)
+        .collect();
+    assert!(ids.contains(&new), "a queued death stamped the replacement");
+    assert!(!ids.contains(&old));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The timed persist that commits B in A's reused slot retires A's queued
+/// death, even when the `tx.body` trim after the commit fails.
+#[cfg(debug_assertions)]
+#[test]
+fn a_committed_timed_persist_retires_queued_deaths() {
+    use rbitcoin_mempool::store::fail_next_mempool_body_adopt;
+    let dir = tmp_dir();
+    let old = Txid::from_byte_array([0xC5; 32]);
+    let new = Txid::from_byte_array([0xC6; 32]);
+    {
+        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        mp.set_now_ms(0);
+        let slot = put_live(&mut mp, &old, 1, 400);
+        mp.flush().unwrap();
+        mp.mark_slot_dead(slot).unwrap();
+        let reused = put_live(&mut mp, &new, 2, 400);
+        assert_eq!(reused, slot);
+        mp.set_now_ms(PERSIST_INTERVAL_MS);
+        fail_next_mempool_body_adopt(&dir);
+        assert!(mp.persist_due().is_err());
+        mp.sync_deaths().unwrap();
+    }
+    let mp = Mempool::open_or_create(&dir).unwrap();
+    let ids: Vec<_> = mp
+        .load_live_txs()
+        .unwrap()
+        .iter()
+        .map(|tx| tx.packed.txid)
+        .collect();
+    assert!(ids.contains(&new), "a queued death stamped the replacement");
+    assert!(!ids.contains(&old));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A slot table that grew on disk but whose sync failed is still not
+/// durable. A retry syncs it again before any mark publishes the larger
+/// `slot_cap`.
+#[cfg(debug_assertions)]
+#[test]
+fn a_retry_syncs_the_grown_slot_file_again() {
+    use rbitcoin_mempool::store::set_mempool_grow_sync_fails;
+    let dir = tmp_dir();
+    let mut mp = Mempool::open_or_create(&dir).unwrap();
+    set_mempool_grow_sync_fails(&dir, true);
+    assert!(mp.grow_slots().is_err());
+    assert!(
+        mp.flush().is_err(),
+        "a retry skipped the sync of the longer slots file"
+    );
+    set_mempool_grow_sync_fails(&dir, false);
+    mp.flush().unwrap();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The body only appends. A persist syncs the new records, then writes and
+/// syncs the body length, before it arms `guard/flush` for slots and meta.
+/// The mark names no `tx.body` page.
+#[cfg(debug_assertions)]
+#[test]
+fn a_persist_appends_the_body_before_the_mark() {
+    use rbitcoin_mempool::store::fail_next_mempool_guard_before_write;
+    let dir = tmp_dir();
+    let id = Txid::from_byte_array([0xB7; 32]);
+    let mut mp = Mempool::open_or_create(&dir).unwrap();
+    mp.set_now_ms(0);
+    put_live(&mut mp, &id, 1, 400);
+    let logical = u64::from_le_bytes(mp.body[8..16].try_into().unwrap());
+    mp.set_now_ms(PERSIST_INTERVAL_MS);
+    fail_next_mempool_guard_before_write(&dir);
+    assert!(mp.persist_due().is_err());
+    let mark = fs::read(dir.join("guard/flush")).unwrap();
+    assert!(
+        !mark.windows(7).any(|w| w == b"tx.body"),
+        "the flush mark must not image tx.body"
+    );
+    let body = fs::read(dir.join("tx.body")).unwrap();
+    assert_eq!(
+        u64::from_le_bytes(body[8..16].try_into().unwrap()),
+        logical,
+        "the body length must land before the mark"
+    );
+    drop(mp);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A persist whose arm fails before the mark is visible has already made
+/// the body durable. The retry must still publish the admit's LIVE slot:
+/// a crash after it reopens with the admit.
+#[cfg(debug_assertions)]
+#[test]
+fn a_retry_after_an_invisible_arm_failure_publishes_the_slot() {
+    let dir = tmp_dir();
+    let first = Txid::from_byte_array([0xE0; 32]);
+    let second = Txid::from_byte_array([0xE1; 32]);
+    let mut mp = Mempool::open_or_create(&dir).unwrap();
+    mp.set_now_ms(0);
+    put_live(&mut mp, &first, 1, 400);
+    mp.set_now_ms(PERSIST_INTERVAL_MS);
+    mp.persist_due().unwrap();
+    put_live(&mut mp, &second, 2, 400);
+    // A file where `guard/` should be: the arm fails before any rename.
+    let guard = dir.join("guard");
+    let _ = fs::remove_dir_all(&guard);
+    fs::write(&guard, b"x").unwrap();
+    mp.set_now_ms(PERSIST_INTERVAL_MS * 2);
+    assert!(mp.persist_due().is_err());
+    assert!(!dir.join("guard/flush").exists());
+    fs::remove_file(&guard).unwrap();
+    mp.set_now_ms(PERSIST_INTERVAL_MS * 3);
+    mp.persist_due().unwrap();
+    // The process dies here: nothing flushes on the way out.
+    std::mem::forget(mp);
+    let mp = Mempool::open_or_create(&dir).unwrap();
+    let live: Vec<_> = mp
+        .load_live_txs()
+        .unwrap()
+        .iter()
+        .map(|tx| tx.packed.txid)
+        .collect();
+    assert!(live.contains(&first));
+    assert!(live.contains(&second), "the retry dropped the admit's slot");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// An admit's body is synced but its arm fails before the mark is visible.
+/// A death-only flush then arms and fails. Settling that mark must not move
+/// the slot watermark past the admit: its slot is in no mark, so the next
+/// persist has to write it, and a crash after that reopens with the admit.
+#[cfg(debug_assertions)]
+#[test]
+fn settling_a_death_mark_keeps_an_unpublished_admit_slot() {
+    use rbitcoin_mempool::store::fail_next_mempool_guard_before_write;
+    let dir = tmp_dir();
+    let first = Txid::from_byte_array([0xE4; 32]);
+    let second = Txid::from_byte_array([0xE5; 32]);
+    let mut mp = Mempool::open_or_create(&dir).unwrap();
+    mp.set_now_ms(0);
+    let first_slot = put_live(&mut mp, &first, 1, 400);
+    mp.set_now_ms(PERSIST_INTERVAL_MS);
+    mp.persist_due().unwrap();
+    put_live(&mut mp, &second, 2, 400);
+    // A file where `guard/` should be: the arm fails before any rename.
+    let guard = dir.join("guard");
+    let _ = fs::remove_dir_all(&guard);
+    fs::write(&guard, b"x").unwrap();
+    mp.set_now_ms(PERSIST_INTERVAL_MS * 2);
+    assert!(mp.persist_due().is_err());
+    fs::remove_file(&guard).unwrap();
+    // A death-only flush arms its mark, then fails before its writes.
+    mp.mark_slot_dead(first_slot).unwrap();
+    fail_next_mempool_guard_before_write(&dir);
+    assert!(mp.sync_deaths().is_err());
+    assert!(dir.join("guard/flush").is_file());
+    mp.set_now_ms(PERSIST_INTERVAL_MS * 3);
+    mp.persist_due().unwrap();
+    // The process dies here: nothing flushes on the way out.
+    std::mem::forget(mp);
+    let mp = Mempool::open_or_create(&dir).unwrap();
+    let live: Vec<_> = mp
+        .load_live_txs()
+        .unwrap()
+        .iter()
+        .map(|tx| tx.packed.txid)
+        .collect();
+    assert!(!live.contains(&first));
+    assert!(
+        live.contains(&second),
+        "settling the death mark dropped the admit's slot"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A failed persist leaves `guard/flush` armed with the admit's LIVE slot.
+/// Removing that tx before the next persist must reach disk, or open
+/// replays the mark and loads the removed tx as LIVE.
+#[cfg(debug_assertions)]
+#[test]
+fn a_removal_supersedes_a_pending_admit_mark() {
+    use rbitcoin_mempool::store::fail_next_mempool_guard_before_write;
+    let dir = tmp_dir();
+    let gone = Txid::from_byte_array([0xD1; 32]);
+    {
+        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        mp.set_now_ms(0);
+        let slot = put_live(&mut mp, &gone, 1, 400);
+        mp.set_now_ms(PERSIST_INTERVAL_MS);
+        fail_next_mempool_guard_before_write(&dir);
+        assert!(mp.persist_due().is_err());
+        assert!(dir.join("guard/flush").is_file());
+        mp.mark_slot_dead(slot).unwrap();
+        mp.sync_deaths().unwrap();
+    }
+    let mp = Mempool::open_or_create(&dir).unwrap();
+    let ids: Vec<_> = mp
+        .load_live_txs()
+        .unwrap()
+        .iter()
+        .map(|tx| tx.packed.txid)
+        .collect();
+    assert!(
+        !ids.contains(&gone),
+        "open replayed the admit after its removal"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The arm can rename `guard/flush` into place and then fail its directory
+/// sync. That mark is visible, so a removal of its admit must still publish.
+#[cfg(debug_assertions)]
+#[test]
+fn a_removal_supersedes_a_mark_whose_arm_failed_after_the_rename() {
+    use rbitcoin_mempool::store::fail_next_mempool_arm_after_rename;
+    let dir = tmp_dir();
+    let gone = Txid::from_byte_array([0xD5; 32]);
+    {
+        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        mp.set_now_ms(0);
+        let slot = put_live(&mut mp, &gone, 1, 400);
+        mp.set_now_ms(PERSIST_INTERVAL_MS);
+        fail_next_mempool_arm_after_rename(&dir);
+        assert!(mp.persist_due().is_err());
+        assert!(dir.join("guard/flush").is_file());
+        mp.mark_slot_dead(slot).unwrap();
+        mp.sync_deaths().unwrap();
+    }
+    let mp = Mempool::open_or_create(&dir).unwrap();
+    let ids: Vec<_> = mp
+        .load_live_txs()
+        .unwrap()
+        .iter()
+        .map(|tx| tx.packed.txid)
+        .collect();
+    assert!(
+        !ids.contains(&gone),
+        "open replayed the admit after its removal"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Slot 170 starts 16 bytes before the 8 KiB page edge. A failed persist
+/// wrote its status and body range on page 4096 but not its txid on page
+/// 8192. A later death-only flush of slot 0 must not drop the armed image
+/// of page 8192, or open finds a LIVE row with the wrong txid.
+#[cfg(debug_assertions)]
+#[test]
+fn a_death_flush_keeps_the_pending_admit_images() {
+    use rbitcoin_mempool::store::fail_next_mempool_guard_before_write;
+    let dir = tmp_dir();
+    let first = Txid::from_byte_array([0xE0; 32]);
+    let late = Txid::from_byte_array([0xEF; 32]);
+    {
+        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        mp.set_now_ms(0);
+        assert_eq!(put_live(&mut mp, &first, 1, 400), 0);
+        for i in 1..170u32 {
+            let mut id = [0xE1; 32];
+            id[..4].copy_from_slice(&i.to_le_bytes());
+            put_live(&mut mp, &Txid::from_byte_array(id), 1, 400);
+        }
+        mp.flush().unwrap();
+        let slot = put_live(&mut mp, &late, 1, 400);
+        assert_eq!(slot, 170);
+        let at = SLOTS_HEADER + 170 * SLOT_REC;
+        assert_eq!(at, 8176, "the record crosses the page at 8192");
+        mp.set_now_ms(PERSIST_INTERVAL_MS);
+        fail_next_mempool_guard_before_write(&dir);
+        assert!(mp.persist_due().is_err());
+        // The first page of the record reached the live file, the second did not.
+        let mut slots = OpenOptions::new()
+            .write(true)
+            .open(dir.join("slots"))
+            .unwrap();
+        slots.seek(SeekFrom::Start(at as u64)).unwrap();
+        slots.write_all(&mp.slots[at..8192]).unwrap();
+        drop(slots);
+        mp.mark_slot_dead(0).unwrap();
+        mp.sync_deaths().unwrap();
+    }
+    let mp = Mempool::open_or_create(&dir).expect("open after the death flush");
+    let ids: Vec<_> = mp
+        .load_live_txs()
+        .unwrap()
+        .iter()
+        .map(|tx| tx.packed.txid)
+        .collect();
+    assert!(!ids.contains(&first), "slot 0 is dead");
+    assert!(ids.contains(&late), "the armed admit is applied whole");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Once a later commit has applied an earlier failed persist, its admit is
+/// on disk. A removal of that admit must still reach disk.
+#[cfg(debug_assertions)]
+#[test]
+fn a_removal_after_a_settled_mark_stays_dead() {
+    use rbitcoin_mempool::store::fail_next_mempool_guard_before_write;
+    let dir = tmp_dir();
+    let durable = Txid::from_byte_array([0xF5; 32]);
+    let gone = Txid::from_byte_array([0xF6; 32]);
+    {
+        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        mp.set_now_ms(0);
+        let first = put_live(&mut mp, &durable, 1, 400);
+        mp.flush().unwrap();
+        let slot = put_live(&mut mp, &gone, 1, 400);
+        mp.set_now_ms(PERSIST_INTERVAL_MS);
+        fail_next_mempool_guard_before_write(&dir);
+        assert!(mp.persist_due().is_err());
+        mp.mark_slot_dead(first).unwrap();
+        mp.sync_deaths().unwrap();
+        mp.mark_slot_dead(slot).unwrap();
+        mp.sync_deaths().unwrap();
+    }
+    let mp = Mempool::open_or_create(&dir).unwrap();
+    let ids: Vec<_> = mp
+        .load_live_txs()
+        .unwrap()
+        .iter()
+        .map(|tx| tx.packed.txid)
+        .collect();
+    assert!(!ids.contains(&durable));
+    assert!(
+        !ids.contains(&gone),
+        "open loaded the admit after its removal"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn reused_dead_slot_persist_due_publishes_the_new_tx() {
+    let dir = tmp_dir();
+    let old = Txid::from_byte_array([0xB1; 32]);
+    let new = Txid::from_byte_array([0xB2; 32]);
+    {
+        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        mp.set_now_ms(0);
+        let slot = put_live(&mut mp, &old, 1, 400);
+        mp.flush().unwrap();
+        mp.set_now_ms(0);
+        mp.mark_slot_dead(slot).unwrap();
+        let reused = put_live(&mut mp, &new, 2, 400);
+        assert_eq!(reused, slot);
+        mp.set_now_ms(PERSIST_INTERVAL_MS);
+        mp.persist_due().unwrap();
+    }
+    let mp = Mempool::open_or_create(&dir).unwrap();
+    let live = mp.load_live_txs().unwrap();
+    let ids: Vec<_> = live.iter().map(|tx| tx.packed.txid).collect();
+    assert!(ids.contains(&new), "the replacement must be durable");
+    assert!(!ids.contains(&old), "the evicted tx must stay gone");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn compact_then_admit_does_not_publish_a_stale_death() {
+    let dir = tmp_dir();
+    let keep = Txid::from_byte_array([0xC1; 32]);
+    let gone = Txid::from_byte_array([0xC2; 32]);
+    let later = Txid::from_byte_array([0xC3; 32]);
+    {
+        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        put_live(&mut mp, &keep, 1, 400);
+        let dead = put_live(&mut mp, &gone, 1, 400);
+        mp.flush().unwrap();
+        mp.mark_slot_dead(dead).unwrap();
+        mp.compact().unwrap();
+        let admitted = put_live(&mut mp, &later, 3, 400);
+        assert_eq!(admitted, dead, "the freed index is reused");
+        mp.sync_deaths().unwrap();
+    }
+    let mp = Mempool::open_or_create(&dir).unwrap();
+    let live = mp
+        .load_live_txs()
+        .expect("a stale death must not publish a zero-length live row");
+    let ids: Vec<_> = live.iter().map(|tx| tx.packed.txid).collect();
+    assert!(ids.contains(&keep), "the packed survivor stays live");
+    assert!(!ids.contains(&gone));
+    assert!(
+        !ids.contains(&later),
+        "the new admit waits for a body persist"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn compact_clears_a_death_index_that_now_names_the_survivor() {
+    let dir = tmp_dir();
+    let keep = Txid::from_byte_array([0xD1; 32]);
+    let gone = Txid::from_byte_array([0xD2; 32]);
+    {
+        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        let dead = put_live(&mut mp, &gone, 1, 400);
+        put_live(&mut mp, &keep, 1, 400);
+        mp.flush().unwrap();
+        mp.mark_slot_dead(dead).unwrap();
+        mp.compact().unwrap();
+        mp.sync_deaths().unwrap();
+    }
+    let mp = Mempool::open_or_create(&dir).unwrap();
+    let live = mp.load_live_txs().unwrap();
+    let ids: Vec<_> = live.iter().map(|tx| tx.packed.txid).collect();
+    assert!(ids.contains(&keep), "the packed survivor stays live");
+    assert!(!ids.contains(&gone));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn dead_of_unpersisted_admit_does_not_resurrect() {
     let dir = tmp_dir();
     {
@@ -549,6 +1204,61 @@ fn persist_deaths_writes_slots_not_body() {
     drop(mp);
     let mp = Mempool::open_or_create(&dir).unwrap();
     assert_eq!(mp.live_count(), 0);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn torn_mempool_page_restores_the_armed_image() {
+    let dir = tmp_dir();
+    let mut mp = Mempool::open_or_create(&dir).unwrap();
+    mp.set_now_ms(0);
+    let raw = tiny_tx();
+    let t1 = Txid::from_byte_array([0x01; 32]);
+    mp.append_live_tx(
+        &raw,
+        &t1,
+        &raw.compute_wtxid(),
+        1,
+        400,
+        0,
+        1_700_000_000,
+        &[],
+    )
+    .unwrap();
+    mp.set_now_ms(PERSIST_INTERVAL_MS);
+    mp.persist_due().unwrap();
+    let t2 = Txid::from_byte_array([0x02; 32]);
+    mp.append_live_tx(
+        &raw,
+        &t2,
+        &raw.compute_wtxid(),
+        2,
+        400,
+        0,
+        1_700_000_000,
+        &[],
+    )
+    .unwrap();
+    mp.set_now_ms(PERSIST_INTERVAL_MS * 2);
+    fail_next_mempool_guard_before_write(&dir);
+    assert!(mp.persist_due().is_err());
+    assert!(dir.join("guard/flush").is_file());
+    drop(mp);
+    // The body only appends and is not imaged. The slots page is.
+    let mut slots = OpenOptions::new()
+        .write(true)
+        .open(dir.join("slots"))
+        .unwrap();
+    slots.seek(SeekFrom::Start(0)).unwrap();
+    slots.write_all(&[0xA5; 4096]).unwrap();
+    slots.sync_all().unwrap();
+    drop(slots);
+    let mp = Mempool::open_or_create(&dir).unwrap();
+    let live = mp.load_live_txs().unwrap();
+    assert_eq!(live.len(), 2, "open copies the armed slots page");
+    assert!(live.iter().any(|row| row.packed.txid == t2));
+    assert!(!dir.join("guard/flush").exists());
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -1250,4 +1960,143 @@ fn live_slot_accept_secs_and_txid_roundtrip() {
     assert_eq!(live[0].packed.txid, tid);
     assert_eq!(live[0].packed.fee_sat, 15);
     assert_eq!(live[0].slot, slot);
+}
+
+/// A persist that failed after its arm already appended and synced the
+/// body. The retry applies the armed mark, appends nothing more, and still
+/// publishes every admit across two body pages.
+#[cfg(debug_assertions)]
+#[test]
+fn a_retried_persist_after_a_failed_mark_keeps_every_admit() {
+    use rbitcoin_mempool::store::fail_next_mempool_guard_before_write;
+    let dir = tmp_dir();
+    let mut ids = Vec::new();
+    {
+        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        mp.set_now_ms(0);
+        let first = Txid::from_byte_array([0xB0; 32]);
+        put_live(&mut mp, &first, 1, 400);
+        ids.push(first);
+        mp.set_now_ms(PERSIST_INTERVAL_MS);
+        mp.persist_due().unwrap();
+        let mut n = 1u32;
+        while mp.body_logical_len().unwrap() < 2 * 4096 {
+            let mut id = [0xB1; 32];
+            id[..4].copy_from_slice(&n.to_le_bytes());
+            let txid = Txid::from_byte_array(id);
+            put_live(&mut mp, &txid, 1, 400);
+            ids.push(txid);
+            n += 1;
+        }
+        mp.set_now_ms(PERSIST_INTERVAL_MS * 2);
+        fail_next_mempool_guard_before_write(&dir);
+        assert!(mp.persist_due().is_err());
+        mp.persist_due().expect("the retry publishes the admits");
+    }
+    let mp = Mempool::open_or_create(&dir).unwrap();
+    let live: Vec<_> = mp
+        .load_live_txs()
+        .unwrap()
+        .iter()
+        .map(|tx| tx.packed.txid)
+        .collect();
+    assert_eq!(live.len(), ids.len());
+    assert!(ids.iter().all(|id| live.contains(id)));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A persist commits B in A's reused slot, arms its mark, and fails before
+/// its writes. A death sync then replays that mark, so the row on disk is B.
+/// A's queued death must not stamp B DEAD.
+#[cfg(debug_assertions)]
+#[test]
+fn a_death_sync_skips_a_replacement_its_mark_replayed() {
+    use rbitcoin_mempool::store::fail_next_mempool_guard_before_write;
+    let dir = tmp_dir();
+    let old = Txid::from_byte_array([0xC8; 32]);
+    let new = Txid::from_byte_array([0xC9; 32]);
+    let mut mp = Mempool::open_or_create(&dir).unwrap();
+    mp.set_now_ms(0);
+    let slot = put_live(&mut mp, &old, 1, 400);
+    mp.flush().unwrap();
+    mp.mark_slot_dead(slot).unwrap();
+    let reused = put_live(&mut mp, &new, 2, 400);
+    assert_eq!(reused, slot);
+    mp.set_now_ms(PERSIST_INTERVAL_MS);
+    fail_next_mempool_guard_before_write(&dir);
+    assert!(mp.persist_due().is_err());
+    mp.sync_deaths().unwrap();
+    // The process dies here: nothing flushes on the way out.
+    std::mem::forget(mp);
+    let mp = Mempool::open_or_create(&dir).unwrap();
+    let ids: Vec<_> = mp
+        .load_live_txs()
+        .unwrap()
+        .iter()
+        .map(|tx| tx.packed.txid)
+        .collect();
+    assert!(ids.contains(&new), "a queued death stamped the replacement");
+    assert!(!ids.contains(&old));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A grow whose slot-file sync failed leaves the longer file undurable. A
+/// death sync must not publish the larger `slot_cap` before that sync
+/// succeeds: a crash can drop the extension, and open would refuse a meta
+/// whose cap the file does not reach.
+#[cfg(debug_assertions)]
+#[test]
+fn a_death_sync_does_not_publish_an_unsynced_slot_growth() {
+    use rbitcoin_mempool::store::set_mempool_grow_sync_fails;
+    let dir = tmp_dir();
+    let id = Txid::from_byte_array([0xCA; 32]);
+    let mut mp = Mempool::open_or_create(&dir).unwrap();
+    let slot = put_live(&mut mp, &id, 1, 400);
+    mp.flush().unwrap();
+    let synced_len = fs::metadata(dir.join("slots")).unwrap().len();
+    set_mempool_grow_sync_fails(&dir, true);
+    assert!(mp.grow_slots().is_err());
+    mp.mark_slot_dead(slot).unwrap();
+    let _ = mp.sync_deaths();
+    set_mempool_grow_sync_fails(&dir, false);
+    std::mem::forget(mp);
+    // Power loss drops the unsynced extension.
+    let slots = OpenOptions::new()
+        .write(true)
+        .open(dir.join("slots"))
+        .unwrap();
+    slots.set_len(synced_len).unwrap();
+    drop(slots);
+    Mempool::open_or_create(&dir).expect("meta named a slot cap the durable file lacks");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A death sync unlinks its mark and then fails the `guard/` sync, so the
+/// unlink may not be durable. A compact must make it durable before the
+/// packed files take their names, or a crash replays the old pages onto
+/// the packed table.
+#[cfg(debug_assertions)]
+#[test]
+fn compact_syncs_a_cleared_mark_away_before_installing() {
+    use rbitcoin_store::page_guard::fail_next_mark_dir_sync;
+    let dir = tmp_dir();
+    let mut mp = Mempool::open_or_create(&dir).unwrap();
+    let gone = put_live(&mut mp, &Txid::from_byte_array([0xCB; 32]), 1, 400);
+    put_live(&mut mp, &Txid::from_byte_array([0xCC; 32]), 1, 400);
+    mp.flush().unwrap();
+    mp.mark_slot_dead(gone).unwrap();
+    let guard = dir.join("guard");
+    fail_next_mark_dir_sync(&guard);
+    assert!(mp.sync_deaths().is_err());
+    assert!(!guard.join("flush").exists());
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    mp.compact().unwrap();
+    let synced = rbitcoin_store::file::take_fsynced_dirs();
+    let guard_at = synced.iter().position(|d| d == &guard);
+    let dir_at = synced.iter().position(|d| d == dir.path());
+    assert!(
+        matches!((guard_at, dir_at), (Some(g), Some(m)) if g < m),
+        "compact installed before guard/ was synced: {synced:?}"
+    );
+    let _ = fs::remove_dir_all(&dir);
 }

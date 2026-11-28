@@ -30,6 +30,7 @@ mod integrity;
 mod io_backend;
 mod io_session_iocp;
 mod open_address;
+mod page_guard;
 mod point_table;
 mod readonly_map;
 mod scripthash;
@@ -37,6 +38,9 @@ mod scripthash_head;
 mod scripthash_layout;
 mod scripthash_materialize;
 mod scripthash_mphf;
+// Every test here fails a guard clear through a debug-only hook.
+#[cfg(debug_assertions)]
+mod scripthash_page_guard;
 mod scripthash_pages;
 mod scripthash_slabs;
 mod scripthash_sorted_head;
@@ -57,3 +61,5 @@ mod txid_body;
 mod txstat;
 mod uring_session;
 mod var_table;
+#[cfg(feature = "write-probe")]
+mod write_probe;

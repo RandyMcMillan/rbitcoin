@@ -290,3 +290,28 @@ pub fn checkpoint_observed_spend_gap(
 ) -> Result<(), crate::StoreError> {
     store.checkpoint_observed_spend_gap(after_first_read, during_sync)
 }
+
+/// Class A writer count sampled when the failure hook last ran on this
+/// thread.
+pub fn class_a_writers_at_last_failure() -> usize {
+    crate::tx_table::WRITERS_AT_LATCH.with(|slot| slot.get())
+}
+
+/// Class A appends `txs` counts as in flight now.
+pub fn class_a_writers(txs: &crate::tx_table::TxTable) -> usize {
+    txs.class_a_writes
+        .load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// One-shot hook run inside the next Class A seal on this thread, after the
+/// latch check at entry and before the writer count is read. A test latches
+/// an append failure there, the way a racing append thread can.
+#[cfg(debug_assertions)]
+pub fn set_before_class_a_seal(hook: Option<crate::tx_table::SealHook>) {
+    crate::tx_table::BEFORE_SEAL.with(|c| *c.borrow_mut() = hook);
+}
+
+/// Latch a Class A failure on `txs`, as a failed append write does.
+pub fn latch_class_a_failure(txs: &crate::tx_table::TxTable) {
+    txs.latch_class_a_failure();
+}

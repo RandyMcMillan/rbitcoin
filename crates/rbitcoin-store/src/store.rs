@@ -1,4 +1,4 @@
-use crate::chain::{ConfirmedTable, HeaderTxsTable, StrongTxTable};
+use crate::chain::{flush_class_c_tables, ConfirmedTable, HeaderTxsTable, StrongTxTable};
 use crate::error::StoreError;
 use crate::hashhead::{HeadOpenOpts, HeadScale};
 use crate::header_table::{HeaderRecord, HeaderTable};
@@ -534,20 +534,14 @@ impl Store {
             return Err(StoreError::NotDirectory(path));
         }
         let meta_ver = check_meta(&path)?;
+        restore_open_marks(&layout)?;
         open_layout_refuse_old(&path, meta_ver)?;
+        open_layout_rewrite_spend_delta(&path, meta_ver)?;
         drop_unread_store_leftovers(&path);
-        let scripthash = if path.join("scripthash.body").exists() {
-            ScriptHashTable::open_with_scale(&path, layout.head_scale)?
-        } else {
-            ScriptHashTable::create_with_scale(&path, layout.head_scale)?
-        };
-        let header_txs = if path.join("header_txs_first.body").exists() {
-            HeaderTxsTable::open(&path)?
-        } else {
-            HeaderTxsTable::create(&path)?
-        };
+        let (scripthash, header_txs) =
+            open_or_create_scripthash_header_txs(&path, layout.head_scale)?;
         let confirmed = ConfirmedTable::open(&path)?;
-        crate::integrity::cut_or_refuse_confirmed_hole(&path, &confirmed)?;
+        let hole_cut = crate::integrity::cut_or_refuse_confirmed_hole(&path, &confirmed)?;
         let height_fence = HeightFence::from_confirmed(&confirmed, &header_txs)?;
         drop_leftover_tx_height(&path);
         crate::scripthash::unlink_scripthash_run_leftovers(&path)?;
@@ -566,13 +560,7 @@ impl Store {
                 schema: meta_ver,
             }),
         )?;
-        // Right after the spend delta published its adoption of a pre-30
-        // `spent.body` (#2038). Before it a crash opens as pre-30 and adopts
-        // again. After it no schema-29 binary may open the datadir: its spend
-        // writes would land in a page log the published delta ignores. The
-        // 29 files go once `meta` 30 is durable.
-        open_layout_rewrite_current(&path, meta_ver)?;
-        crate::spend_pages_v29::remove(&path)?;
+        finish_spend_delta_adoption(&path, meta_ver, &confirmed, hole_cut)?;
         if layout.is_split() {
             write_seqsigwit_reloc(&path)?;
         }
@@ -622,7 +610,7 @@ impl Store {
     pub fn open_or_create_layout(layout: StoreLayout) -> Result<Self, StoreError> {
         let dir = layout.dir.clone();
         if !dir.join("meta").exists() {
-            if creation_has_chain(&layout) {
+            if creation_has_chain(&layout) || has_guard_mark(&layout.dir)? {
                 return Err(StoreError::Corrupt("store meta missing"));
             }
             if incomplete_creation_files(&layout) {
@@ -639,6 +627,9 @@ impl Store {
             Err(err)
                 if !creation_has_chain(&layout) && replaces_incomplete_first_creation(&err) =>
             {
+                if has_guard_mark(&layout.dir)? {
+                    return Err(err);
+                }
                 rbitcoin_log::warn!(
                     "store: replacing incomplete first creation at {} ({err})",
                     dir.display()
@@ -907,8 +898,25 @@ impl Store {
         // A durable body association must name durable creates.
         self.txs.sync_class_a_data()?;
         self.headers.flush()?;
-        self.header_txs.flush()?;
+        let _write = self.header_txs.write_guard();
+        flush_class_c_tables(&[&self.header_txs.first, &self.header_txs.count])?;
         Ok(())
+    }
+
+    /// Store header ranges that name appended creates.
+    ///
+    /// Class A first: an fd-only pair is durable when its put returns, so
+    /// the creates it names are synced before it. A RAM-tier pair reaches
+    /// disk only at a barrier, which syncs Class A first itself.
+    pub fn put_header_ranges(
+        &self,
+        write: &crate::array_table::ClassCWrite,
+        items: &[(Fk, Fk, u32)],
+    ) -> Result<(), StoreError> {
+        if !items.is_empty() && self.header_txs.fd_pair() {
+            self.txs.sync_class_a_data()?;
+        }
+        self.header_txs.put_ranges_batch(write, items)
     }
 
     /// Meta by fk: the same packed decode as [`Self::get_tx_meta_and_outputs`]
@@ -1043,7 +1051,7 @@ impl Store {
     }
 
     pub fn write_txstat_row(&self, fk: Fk, row: &crate::TxStatRow) -> Result<(), StoreError> {
-        self.txs.txstat.write_row(fk, row)
+        self.txs.stamp_txstat(|t| t.write_row(fk, row))
     }
 
     /// Stamp a confirmed block's `txstat` cells and that header's overflow blob.
@@ -1053,7 +1061,8 @@ impl Store {
         first_fk: u64,
         rows: &[crate::TxStatRow],
     ) -> Result<(), StoreError> {
-        self.txs.txstat.write_block_rows(header_fk, first_fk, rows)
+        self.txs
+            .stamp_txstat(|t| t.write_block_rows(header_fk, first_fk, rows))
     }
 
     /// One `txstat.body` row, or `None` if unstamped (all-zero). Loads overflow if needed.
@@ -2067,8 +2076,12 @@ impl Store {
         self.txs.sync_class_a_data()?;
         // Headers first so conf tip cannot reference a non-durable header_fk.
         self.headers.flush()?;
-        self.strong_tx.flush()?;
-        self.header_txs.flush()?;
+        let _write = self.header_txs.write_guard();
+        flush_class_c_tables(&[
+            &self.strong_tx.table,
+            &self.header_txs.first,
+            &self.header_txs.count,
+        ])?;
         Ok(())
     }
 
@@ -2229,9 +2242,10 @@ impl Store {
                     filtered.store(seen, Ordering::Release);
                 }
                 // Every spender a frozen note names was appended before the
-                // freeze. Sync it before the commit can name its number.
+                // freeze, so the flush's sampled end covers it. Its nodes and
+                // then that length are synced before the commit names them.
+                spenders.flush()?;
                 let named = txs.settled_count();
-                spenders.sync_data_only()?;
                 txs.sync_class_a_named(named)?;
                 Ok(())
             },
@@ -2353,7 +2367,6 @@ impl Store {
         after_first_read(self);
         let Some(height) = self.spend_snapshot_height() else {
             let tip = self.confirmed.tip_height().map(|h| h.0).unwrap_or(0);
-            self.spenders.sync_data_only()?;
             self.publish_open_spend_pages(tip, |meta| self.spend_slot_still_live(meta))?;
             return Ok(());
         };
@@ -2472,9 +2485,19 @@ impl Store {
     /// The tip this call sealed, `None` for an empty chain. After a failed
     /// Class A write or sync, the latch fails this call.
     pub fn flush_class_c_tip(&self) -> Result<Option<Height>, StoreError> {
-        self.flush_class_c_pre_tip()?;
-        // Commit point on disk: tip advance only after strong/header_txs.
-        self.confirmed.flush()?;
+        self.txs.sync_class_a_data()?;
+        self.headers.flush()?;
+        // One mark for the four Class C files, then tip_seal. Confirmed is
+        // last in the persist order so a kill cannot advance tip first.
+        {
+            let _write = self.header_txs.write_guard();
+            flush_class_c_tables(&[
+                &self.strong_tx.table,
+                &self.header_txs.first,
+                &self.header_txs.count,
+                &self.confirmed.arr,
+            ])?;
+        }
         self.publish_tip_seal()?;
         Ok(self.confirmed.tip_height())
     }
@@ -2484,7 +2507,7 @@ impl Store {
     /// Used by **disconnect** after RAM truncate so tip shrink is durable **before**
     /// unstrong. Do not use for connect (would tip-first).
     pub fn flush_confirmed_only(&self) -> Result<(), StoreError> {
-        self.confirmed.flush()?;
+        flush_class_c_tables(&[&self.confirmed.arr])?;
         self.publish_tip_seal()?;
         Ok(())
     }
@@ -2492,7 +2515,7 @@ impl Store {
     /// Class C **disconnect** post-clear barrier: strong after tip already
     /// shrunk and flushed via [`Self::flush_confirmed_only`].
     pub fn flush_class_c_after_disconnect_tip(&self) -> Result<(), StoreError> {
-        self.strong_tx.flush()?;
+        flush_class_c_tables(&[&self.strong_tx.table])?;
         // header_txs unchanged on disconnect (archive association remains).
         Ok(())
     }
@@ -2512,29 +2535,59 @@ impl Store {
 
     /// Process-exit flush (IBD / SIGTERM). Target: seconds, not minutes.
     ///
-    /// 1. The connect barrier: Class A `sync_data`, then the Class C tables.
-    /// 2. MS_ASYNC Class A bodies and the derived heads.
-    /// 3. Snapshot the open `tx.head`. That error is logged. It does not
-    ///    skip the writebacks, and a writeback error does not skip it.
-    pub fn flush_for_shutdown(&self) -> Result<(), StoreError> {
+    /// The step that is costliest to lose runs first. A failed step does not
+    /// skip the steps after it. Each failure is logged, and the first is
+    /// returned.
+    ///
+    /// 1. A dirty scripthash index gets a synced flush, which clears
+    ///    `scripthash.dirty`. Left behind, the mark refuses the next start
+    ///    until a full rebuild from Class A. Its postings name only sealed
+    ///    creates, so this step does not wait for the seal below.
+    /// 2. Headers, then the connect barrier (Class A `sync_data`, then the
+    ///    Class C tables). The barrier runs only when `seal_tip` is set and
+    ///    the header sync succeeded: a retried fsync can return 0 over pages
+    ///    the kernel dropped. Without it the next start resumes from the last
+    ///    seal.
+    /// 3. MS_ASYNC writeback of the Class A bodies and `spent.ovf`.
+    /// 4. One dense snapshot of the open `tx.head` tail. Not [`Self::flush`],
+    ///    which fsyncs every Class A body. Without it open rebuilds that tail
+    ///    from `txid.body`, so its error is logged and not returned.
+    pub fn flush_for_shutdown(&self, seal_tip: bool) -> Result<(), StoreError> {
         let t0 = std::time::Instant::now();
-        rbitcoin_log::info!("store: shutdown flush — fsync tip tables…");
-        self.headers.flush()?;
-        self.flush_class_c_tip()?;
-        rbitcoin_log::info!(
-            "store: shutdown flush — async Class A… elapsed={:?}",
-            t0.elapsed()
-        );
-        let txs = self.txs.flush_async();
-        let spenders = self.spenders.flush_async();
-        let scripthash = self.scripthash.flush_for_close();
-        // One dense image of the open tx.head tail. Not Store::flush: that
-        // fsyncs every Class A body.
-        if let Err(e) = self.txs.flush_head() {
-            rbitcoin_log::warn!("store: shutdown tx.head snapshot failed: {e}");
+        let mut first = None;
+        let mut step = |what: &str, done: Result<(), StoreError>| match done {
+            Ok(()) => rbitcoin_log::info!(
+                "store: shutdown flush — {what} done elapsed={:?}",
+                t0.elapsed()
+            ),
+            Err(e) => {
+                rbitcoin_log::warn!("store: shutdown flush — {what} failed: {e}");
+                first.get_or_insert(e);
+            }
+        };
+        step("scripthash", self.scripthash.flush_for_close());
+        let headers = self.headers.flush();
+        let headers_synced = headers.is_ok();
+        step("headers", headers);
+        if seal_tip && headers_synced {
+            step("tip seal", self.flush_class_c_tip().map(|_| ()));
+        } else {
+            rbitcoin_log::warn!(
+                "store: shutdown flush — tip seal skipped; the next start resumes \
+                 from the last seal"
+            );
         }
-        rbitcoin_log::info!("store: shutdown flush done elapsed={:?}", t0.elapsed());
-        txs.and(spenders).and(scripthash)
+        let spenders = self.spenders.flush_async();
+        step("Class A writeback", self.txs.flush_async().and(spenders));
+        // Open rebuilds the tail from `txid.body`, so a failure is only logged.
+        match self.txs.flush_head() {
+            Ok(()) => rbitcoin_log::info!(
+                "store: shutdown flush — tx.head snapshot done elapsed={:?}",
+                t0.elapsed()
+            ),
+            Err(e) => rbitcoin_log::warn!("store: shutdown flush — tx.head snapshot failed: {e}"),
+        }
+        first.map_or(Ok(()), Err)
     }
 }
 
@@ -2657,6 +2710,30 @@ fn dir_has_chain_payload(dir: &Path) -> bool {
     )
 }
 
+/// A published `guard/` mark names pages a write was changing, so the
+/// store is not an untouched first creation. An unreadable mark must reach
+/// the caller, not be wiped with the store. Only a missing `guard/` is
+/// `Ok(false)`: a directory or entry that cannot be read may hold a mark.
+fn has_guard_mark(dir: &Path) -> Result<bool, StoreError> {
+    let guard = dir.join(crate::page_guard::GUARD_DIR);
+    let rd = match std::fs::read_dir(&guard) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(StoreError::io(&guard, e)),
+    };
+    for ent in rd {
+        let ent = ent.map_err(|e| StoreError::io(&guard, e))?;
+        if ent.file_name().to_string_lossy().ends_with(".tmp") {
+            continue;
+        }
+        let kind = ent.file_type().map_err(|e| StoreError::io(ent.path(), e))?;
+        if kind.is_file() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn creation_has_chain(layout: &StoreLayout) -> bool {
     dir_has_chain_payload(&layout.dir)
         || (layout.is_split() && dir_has_chain_payload(layout.seqsigwit_dir()))
@@ -2716,8 +2793,52 @@ pub fn unlink_leftover_spent_off(dir: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Copy armed page images back before trim or the tip walk. Every mark lives
+/// in the hot store directory: the cold directory holds only appends, which
+/// need none. The header marks are replayed by the header table open.
+#[doc(hidden)]
+pub fn restore_open_marks(layout: &StoreLayout) -> Result<(), StoreError> {
+    restore_hot_marks(&layout.dir)
+}
+
+fn restore_hot_marks(path: &Path) -> Result<(), StoreError> {
+    crate::page_guard::restore_store_group(path, crate::page_guard::CLASS_C_MARK)?;
+    restore_sh_marks_or_rebuild(path)?;
+    Ok(())
+}
+
+/// Open the scripthash table, or create it. A rebuild a restore asked for
+/// discards the index first.
+fn open_scripthash(path: &Path, scale: HeadScale) -> Result<ScriptHashTable, StoreError> {
+    crate::scripthash::discard_index_for_rebuild(path)?;
+    if path.join("scripthash.body").exists() {
+        ScriptHashTable::open_with_scale(path, scale)
+    } else {
+        ScriptHashTable::create_with_scale(path, scale)
+    }
+}
+
+/// A `guard/sh-*` mark that does not parse is scripthash damage, which
+/// rebuilds from Class A. Request that rebuild and drop the scripthash marks
+/// instead of stopping open. An OS error still stops open.
+fn restore_sh_marks_or_rebuild(path: &Path) -> Result<(), StoreError> {
+    match crate::page_guard::restore_sh_marks(path) {
+        Err(StoreError::Corrupt(why)) => {
+            rbitcoin_log::warn!(
+                "store: scripthash guard mark unreadable ({}); rebuilding the scripthash index",
+                why
+            );
+            crate::scripthash::mark_sh_rebuild(path)?;
+            crate::page_guard::clear_sh_marks(path)
+        }
+        other => other,
+    }
+}
+
 #[doc(hidden)]
 pub fn open_layout_refuse_old(path: &Path, meta_ver: u16) -> Result<(), StoreError> {
+    // Only meta 24/25 names 96-byte rows. The conversion renames the
+    // rewritten body into place before any meta write.
     if (24..=25).contains(&meta_ver) {
         HeaderTable::rewrite_v24_body_to_88(path)?;
     }
@@ -2748,6 +2869,44 @@ pub fn drop_unread_store_leftovers(path: &Path) {
     }
 }
 
+/// Open `scripthash` and `header_txs`, creating either one when its body
+/// file is missing.
+fn open_or_create_scripthash_header_txs(
+    path: &Path,
+    head_scale: HeadScale,
+) -> Result<(ScriptHashTable, HeaderTxsTable), StoreError> {
+    let scripthash = open_scripthash(path, head_scale)?;
+    let header_txs = if path.join("header_txs_first.body").exists() {
+        HeaderTxsTable::open(path)?
+    } else {
+        HeaderTxsTable::create(path)?
+    };
+    Ok((scripthash, header_txs))
+}
+
+/// Runs right after the spend delta published its adoption of a pre-30
+/// `spent.body` (#2038). Before it a crash opens as pre-30 and adopts
+/// again. After it no schema-29 binary may open the datadir: its spend
+/// writes would land in a page log the published delta ignores. The 29
+/// files go once `meta` 30 is durable.
+///
+/// `meta` is current before the hole cut's flush arms the first mark.
+/// Only after the adoption: before it, a 31 `meta` beside a populated
+/// `spent.body` with no `spent.delta/` refuses.
+fn finish_spend_delta_adoption(
+    path: &Path,
+    meta_ver: u16,
+    confirmed: &ConfirmedTable,
+    hole_cut: bool,
+) -> Result<(), StoreError> {
+    open_layout_rewrite_current(path, meta_ver)?;
+    crate::spend_pages_v29::remove(path)?;
+    if hole_cut {
+        confirmed.flush()?;
+    }
+    Ok(())
+}
+
 #[doc(hidden)]
 pub fn drop_leftover_tx_height(path: &Path) {
     let leftover_h = path.join("tx_height.body");
@@ -2764,6 +2923,18 @@ pub fn drop_leftover_tx_height(path: &Path) {
 /// datadir, and to [`SCHEMA_VERSION`] only once the spend delta has adopted
 /// the old `spent.body` ([`open_layout_rewrite_current`]).
 const SCHEMA_BEFORE_SPEND_DELTA: u16 = 29;
+
+/// `meta` 30 to [`SCHEMA_VERSION`] before open writes anything else. A 30
+/// store already has its spend delta, so nothing waits on an adoption, and
+/// no page-guard mark is ever on disk beside a `meta` a 30 binary opens.
+/// Older `meta` reaches the current schema after the adoption
+/// ([`open_layout_rewrite_current`]); open arms no mark before that.
+fn open_layout_rewrite_spend_delta(path: &Path, meta_ver: u16) -> Result<(), StoreError> {
+    if meta_ver == 30 {
+        write_meta(path)?;
+    }
+    Ok(())
+}
 
 /// `meta` to [`SCHEMA_BEFORE_SPEND_DELTA`] when it is older.
 #[doc(hidden)]

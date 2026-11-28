@@ -203,20 +203,26 @@ impl TipFault {
 /// the window used to. A null anywhere else is not crash damage. Open would
 /// build a fence without that height and clear its strong bits, so it
 /// refuses before any repair runs.
+///
+/// The cut is in RAM. `true` means the caller flushes `confirmed` once the
+/// spend delta has adopted a pre-30 `spent.body` and `meta` is current. The
+/// flush arms a mark, which needs a current `meta`, and a current `meta`
+/// beside a populated body with no `spent.delta/` refuses. A stop before
+/// that flush cuts again at the next open.
 pub(crate) fn cut_or_refuse_confirmed_hole(
     dir: &Path,
     confirmed: &crate::chain::ConfirmedTable,
-) -> Result<(), StoreError> {
+) -> Result<bool, StoreError> {
     use crate::array_table::{ELEM, FLUSH_SCRATCH};
     use crate::file::FILE_HEADER_LEN;
     let Some(tip) = confirmed.tip_height() else {
-        return Ok(());
+        return Ok(false);
     };
     let cap = TipSeal::load(dir)?.map_or(tip.0, |s| s.tip_height.min(tip.0));
     let mut top = cap;
     while confirmed.get(Height(top))?.is_none() {
         let Some(below) = top.checked_sub(1) else {
-            return Ok(());
+            return Ok(false);
         };
         top = below;
     }
@@ -225,7 +231,7 @@ pub(crate) fn cut_or_refuse_confirmed_hole(
         Ok(None) => Some(Ok(h)),
         Err(e) => Some(Err(e)),
     }) else {
-        return Ok(());
+        return Ok(false);
     };
     let hole = hole?;
     // The block is the one that holds the sealed tip, not the top non-null
@@ -244,7 +250,7 @@ pub(crate) fn cut_or_refuse_confirmed_hole(
     );
     let write = crate::array_table::ClassCWrite::new();
     confirmed.arr.truncate(&write, u64::from(hole))?;
-    confirmed.flush()
+    Ok(true)
 }
 
 impl Store {

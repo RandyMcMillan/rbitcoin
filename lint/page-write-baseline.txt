@@ -41,7 +41,6 @@ crates/rbitcoin-store/src/store.rs	fs_write	1
 crates/rbitcoin-store/src/store_secret.rs	write_all	1
 crates/rbitcoin-store/src/testutil.rs	write_all	1
 crates/rbitcoin-store/src/tx_head_mphf.rs	fs_write	1
-crates/rbitcoin-store/src/txstat.rs	write_all	2
 crates/rbitcoin-store/src/uring_session.rs	opcode_Write	1
 crates/rbitcoin-store/src/var_table.rs	WriteOp	2
 crates/rbitcoin-store/src/var_table.rs	pwrite_batch	2

@@ -72,7 +72,8 @@ def main():
     seen, counts, reasons, bad = set(), {}, {}, []
     for e in ents:
         head = e[0].split()
-        key = (head[1], head[2], head[3] if len(head) > 3 else "")
+        # The whole header: a demangled caller can hold a space.
+        key = e[0].rsplit(" end=", 1)[0]
         if key in seen:
             continue
         seen.add(key)

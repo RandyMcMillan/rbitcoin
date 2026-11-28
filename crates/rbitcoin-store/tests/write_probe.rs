@@ -70,10 +70,42 @@ fn a_sync_begun_before_a_footer_lands_does_not_make_it_durable() {
         WriteKind::Length,
     );
     let early = sync_begin(&path);
-    drop(landing);
+    landing.landed();
     synced(&path, early);
     let (class, durable, _landing) = classify(&path, 0, 150, &[0; 10], true, 0, WriteKind::Payload);
     assert_eq!((class, durable), (None, 100));
+}
+
+fn footer(path: &Path, durable: u64, new: u64) -> Landing {
+    let footer = TRAILING_FOOTER_LEN as u64;
+    classify(
+        path,
+        durable,
+        new - footer,
+        &new.to_le_bytes(),
+        true,
+        0,
+        WriteKind::Length,
+    )
+    .2
+}
+
+#[test]
+fn a_footer_write_that_failed_keeps_the_durable_end() {
+    let path = probe_path("footer-failed");
+    opened_trailing(&path, 8192);
+    // Dropped without `landed`: the write returned `Err`.
+    drop(footer(&path, 8192, 4096));
+    full_sync(&path);
+    let (class, durable, _landing) =
+        classify(&path, 0, 5000, &[0; 10], true, 0, WriteKind::Payload);
+    assert_eq!((class, durable), (Some("ONE_SECTOR"), 8192));
+
+    footer(&path, 8192, 4096).landed();
+    full_sync(&path);
+    let (class, durable, _landing) =
+        classify(&path, 0, 5000, &[0; 10], true, 0, WriteKind::Payload);
+    assert_eq!((class, durable), (None, 4096));
 }
 
 #[test]

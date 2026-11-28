@@ -16,6 +16,8 @@ assert_fail "a multi-sector write with no reviewed reason fails" \
   python3 "$PY" "$FIX/unclassified.log"
 assert_fail "a length on a live mark that misses the publish fails" \
   python3 "$PY" "$FIX/len-on-mark.log"
+assert_fail "a caller with a space does not hide a second, unreviewed stack" \
+  python3 "$PY" "$FIX/caller-space.log"
 assert_fail "an empty log fails: the probe did not run" \
   python3 "$PY" "$FIX/empty.log"
 assert_fail "a missing log fails" \

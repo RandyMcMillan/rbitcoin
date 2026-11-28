@@ -149,13 +149,22 @@ fn unsynced_in(path: &Path, from: u64, to: u64) -> bool {
 /// once the write returns, `Ok` or `Err`: a failed write may have landed
 /// some bytes. A payload range takes its sequence number then, so a sync
 /// that began while it was in flight does not clear it. A trailer becomes
-/// the last one written then.
+/// the last one written only through [`Landing::landed`]: after an `Err`
+/// the file's footer is unknown, so the previous end stays.
 #[must_use = "hold it until the write returns"]
 #[doc(hidden)]
 pub struct Landing {
     path: PathBuf,
     payload: Option<u64>,
     trailer: Option<u64>,
+    ok: bool,
+}
+
+impl Landing {
+    /// The write returned `Ok`.
+    pub fn landed(mut self) {
+        self.ok = true;
+    }
 }
 
 impl Drop for Landing {
@@ -170,7 +179,7 @@ impl Drop for Landing {
                 }
             }
         }
-        if let Some(end) = self.trailer {
+        if let Some(end) = self.trailer.filter(|_| self.ok) {
             trailers()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -234,6 +243,7 @@ pub fn classify(
         path: path.to_path_buf(),
         payload: None,
         trailer: None,
+        ok: false,
     };
     let len = bytes.len() as u64;
     if len == 0 {

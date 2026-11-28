@@ -998,13 +998,16 @@ impl TableFile {
     /// poisoned file before it changes RAM.
     fn pwrite_length(&self, committed: u64, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
         #[cfg(feature = "write-probe")]
-        let _landing = self.probe(
+        let landing = self.probe(
             committed,
             offset,
             bytes,
             crate::write_probe::WriteKind::Length,
         );
-        self.pwrite_door(committed, offset, bytes)
+        self.pwrite_door(committed, offset, bytes).inspect(|()| {
+            #[cfg(feature = "write-probe")]
+            landing.landed();
+        })
     }
 
     /// Classify a payload write that bypasses the door (bulk io_uring) as the

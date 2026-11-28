@@ -183,18 +183,12 @@ fn seal_both(
         query.write_basic_filters(table, filters.start, &filters.items, |recs| table.put(recs))?;
         return Ok(true);
     };
-    let mut tweaks_fit = tweaks
-        .first()
-        .is_some_and(|item| item.0 == tweak_table.next_height());
-    if tweaks_fit {
-        for (height, header_fk, _) in tweaks {
-            if query.store.confirmed.get(*height)? != Some(*header_fk) {
-                tweaks_fit = false;
-                break;
-            }
-        }
-    }
-    if !tweaks_fit {
+    if !query.tweak_rows_still_next(
+        tweak_table.next_height(),
+        tweaks
+            .iter()
+            .map(|(height, header_fk, _)| (*height, *header_fk)),
+    )? {
         drop(guard);
         query.write_basic_filters(table, filters.start, &filters.items, |recs| table.put(recs))?;
         return Ok(true);
@@ -203,13 +197,10 @@ fn seal_both(
         .iter()
         .map(|(height, _, records)| (*height, records.as_slice()))
         .collect();
-    let staged = tweak_table.stage_blocks(&refs)?;
+    // Stage inside the filter commit. A watermark that moved returns before
+    // this runs, so a tweak roll is not left behind by a dropped stage.
     let n = query.write_basic_filters(table, filters.start, &filters.items, |recs| {
-        rbitcoin_store::block_filter::commit_filters_with_tweaks(table, recs, &staged)
+        rbitcoin_store::block_filter::seal_filter_and_tweak_puts(table, recs, tweak_table, &refs)
     })?;
-    if n == 0 {
-        return Ok(true);
-    }
-    staged.committed();
-    Ok(false)
+    Ok(n == 0)
 }

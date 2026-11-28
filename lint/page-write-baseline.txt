@@ -18,12 +18,15 @@ crates/rbitcoin-store/src/file.rs	pwrite	1
 crates/rbitcoin-store/src/file.rs	set_file_len	7
 crates/rbitcoin-store/src/file.rs	set_len	2
 crates/rbitcoin-store/src/file.rs	truncate	1
+crates/rbitcoin-store/src/file.rs	win_set_eof	1
 crates/rbitcoin-store/src/file.rs	write_all	4
 crates/rbitcoin-store/src/fuse8_filter.rs	write_all	4
 crates/rbitcoin-store/src/hashhead.rs	write_all	1
 crates/rbitcoin-store/src/input.rs	truncate	1
 crates/rbitcoin-store/src/integrity.rs	truncate	1
+crates/rbitcoin-store/src/io_handle.rs	WriteFile	1
 crates/rbitcoin-store/src/io_handle.rs	pwrite	2
+crates/rbitcoin-store/src/io_session_iocp.rs	WriteFile	1
 crates/rbitcoin-store/src/io_session_pool.rs	pwrite	1
 crates/rbitcoin-store/src/scripthash_head.rs	write_all	1
 crates/rbitcoin-store/src/scripthash_mphf.rs	handle_pwrite_all	1

@@ -53,6 +53,21 @@ assert_fail "FileExt::write_at split after the path fails an empty baseline" \
 assert_fail "a cooked string across lines does not hide a later write" \
   python3 "$PY" --root "$FIX/multiline-string"
 
+assert_fail "a Windows WriteFile call fails an empty baseline" \
+  python3 "$PY" --root "$FIX/win-write-file"
+assert_ok "an extern WriteFile declaration is not a call" \
+  python3 "$PY" --root "$FIX/win-write-file-decl"
+assert_fail "a Windows seek_write fails an empty baseline" \
+  python3 "$PY" --root "$FIX/seek-write"
+assert_fail "a win_set_eof call fails an empty baseline" \
+  python3 "$PY" --root "$FIX/win-set-eof"
+assert_fail "io::Write::write of borrowed bytes after a seek fails an empty baseline" \
+  python3 "$PY" --root "$FIX/io-write"
+assert_fail "io::Write::write split before its borrowed bytes fails an empty baseline" \
+  python3 "$PY" --root "$FIX/io-write-split"
+assert_ok "RwLock write, OpenOptions write, and write_guard are not counted" \
+  python3 "$PY" --root "$FIX/lock-write"
+
 if [[ "$FAIL" -ne 0 ]]; then
   echo "page-write-ratchet.test.sh: $PASS passed, $FAIL failed"
   exit 1

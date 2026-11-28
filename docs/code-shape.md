@@ -130,7 +130,8 @@ Raw store and mempool page writes are frozen per file and per token in
 gains one, and when a cleanup leaves the old count in place. The tokens
 are `pwrite`, `pwrite_batch`, `pwrite_exact`, `handle_pwrite_all`,
 `set_len`, `set_file_len`, `truncate`, `fs::write`, `WriteOp`, an io_uring
-`opcode::Write`, and any mention of `FileExt` (its import or a
+`opcode::Write`, its Windows twin `WriteFile`, `seek_write`, `win_set_eof`,
+`std::io::Write::write` of borrowed bytes (`.write(&bytes)`), and any mention of `FileExt` (its import or a
 path-qualified call), since its method `write_at` shares the door's name.
 A method-form call names no trait, so in a file that mentions `FileExt`
 each `write_at` and `write_all_at` call also counts as `FileExt_write`,

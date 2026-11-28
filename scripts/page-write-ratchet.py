@@ -15,6 +15,17 @@ whole new file or a temp before a rename, or replay a synced ahead image
 in place at open. The baseline freezes them per file, so a new
 `std::io::Write::write_all` on a store data file moves its line. `handle_pwrite_all(` does not match inside `pwrite_all`.
 
+`io_write` is `std::io::Write::write` with a borrowed byte argument
+(`file.write(&bytes)`), the short-write form of `write_all`. It needs the
+leading `.` and the `&`, so `RwLock::write()`, `OpenOptions::write(true)`,
+and `write_guard()` do not match.
+
+The Windows raw writes count too. `WriteFile` is the overlapped submit
+in `win_xfer` and `IocpEngine::issue`, the twin of `opcode_Write`.
+`seek_write` is the Windows `FileExt` positional write. `win_set_eof`
+resizes a file like `set_len`. For `WriteFile` and `win_set_eof` only
+calls count; the `fn` line that declares or defines one does not.
+
 `write_at`, `write_at_pwrite`, `write_uncommitted`, `pwrite_all`,
 `persist_hwm`, `persist_logical_len`, `write_trailer`, and `zero_range`
 go through `TableFile::pwrite_all` or the same armed-page check. They
@@ -48,7 +59,15 @@ TOKENS = (
     ("set_len", r"(?<![A-Za-z0-9_])set_len\s*\(", None),
     ("truncate", r"(?<![A-Za-z0-9_])truncate\s*\(", None),
     ("write_all", r"(?<![A-Za-z0-9_])write_all\s*\(", None),
+    ("io_write", r"\.write\s*\(\s*&", None),
+    ("WriteFile", r"(?<![A-Za-z0-9_])(?<!fn )WriteFile\s*\(", None),
+    ("seek_write", r"(?<![A-Za-z0-9_])seek_write\s*\(", None),
+    ("win_set_eof", r"(?<![A-Za-z0-9_])(?<!fn )win_set_eof\s*\(", None),
 )
+
+# A split a token's own pattern does not imply: (previous line, this line).
+# rustfmt can break `.write(` from its `&bytes` argument.
+SPLITS = {"io_write": (r"\.write\s*\(\s*$", r"^\s*&")}
 
 # Counted only in a file whose `FileExt` count is above zero. The method
 # form `file.write_at(..)` names no trait, so the import alone would hide
@@ -73,7 +92,9 @@ def scan(root: str) -> dict[str, int]:
         # A bare name (`FileExt`) has no opener to split from.
         call = re.match(r"(.*)\\s\*(\\\(|\\\{)$", pattern)
         split = None
-        if call:
+        if token in SPLITS:
+            split = tuple(re.compile(rx) for rx in SPLITS[token])
+        elif call:
             name, opener = call.groups()
             split = (re.compile(name + r"\s*$"), re.compile(r"^\s*" + opener))
         compiled.append((token, re.compile(pattern), only, split))

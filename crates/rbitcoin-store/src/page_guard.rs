@@ -1033,24 +1033,30 @@ pub fn append_past_end(
 /// `bytes` go at `at`, which is at or past the file's committed end.
 /// `new_logical` is the length the leading header names afterwards.
 #[doc(hidden)]
+#[derive(Clone, Copy)]
 pub struct Append<'a> {
     pub file: &'a TableFile,
     pub at: u64,
     pub bytes: &'a [u8],
     pub new_logical: u64,
+    /// Length-publish wave. Wave 0 is written and synced before wave 1 is
+    /// written. Files that share a wave share one sync.
+    pub length_wave: u32,
 }
 
 /// Publish a group of appends with no mark, under the sector rule.
 ///
-/// Every file's bytes are written past its published end, then every file
-/// is synced, then each new length is published and synced in the order the
-/// files first appear. A body listed before its index is therefore durable,
-/// bytes and length, before the index length that names it. A crash leaves
-/// each file at its old length or its new one, and bytes past a length are
-/// not read. A format whose last record ends at the body length must fit
-/// that record on open, as `sp_tweaks` does. On an error a length may
-/// already be durable, so every file in the group is poisoned: it refuses
-/// writes until reopen fits the group.
+/// Every file's bytes are written past its published end and synced
+/// together. Lengths then go out one [`Append::length_wave`] at a time:
+/// that wave's lengths are written and synced before the next wave's
+/// lengths are written. A body at wave 0 and its index at wave 1 is
+/// durable, bytes and length, before the index length that names it.
+/// Files that share a wave share the sync. A crash leaves each file at
+/// its old length or its new one, and bytes past a length are not read.
+/// A format whose last record ends at the body length must fit that
+/// record on open, as `sp_tweaks` does. On an error a length may already
+/// be durable, so every file in the group is poisoned: it refuses writes
+/// until reopen fits the group.
 #[doc(hidden)]
 pub fn commit_appends(writes: &[Append<'_>]) -> Result<(), StoreError> {
     let committed = commit_appends_once(writes);
@@ -1067,7 +1073,12 @@ fn commit_appends_once(writes: &[Append<'_>]) -> Result<(), StoreError> {
     for w in writes {
         w.file.refuse_if_poisoned()?;
     }
-    let mut files: Vec<(&TableFile, u64)> = Vec::new();
+    struct Published<'a> {
+        file: &'a TableFile,
+        end: u64,
+        wave: u32,
+    }
+    let mut files: Vec<Published<'_>> = Vec::new();
     for w in writes {
         if w.file.trailing_header {
             return Err(StoreError::Corrupt("an append needs a leading-header file"));
@@ -1076,19 +1087,39 @@ fn commit_appends_once(writes: &[Append<'_>]) -> Result<(), StoreError> {
             return Err(StoreError::Rejected("append overwrites committed bytes"));
         }
         w.file.write_uncommitted(w.at, w.bytes)?;
-        match files.iter_mut().find(|(f, _)| f.path() == w.file.path()) {
-            Some((_, end)) => *end = (*end).max(w.new_logical),
-            None => files.push((w.file, w.new_logical)),
+        match files.iter_mut().find(|f| f.file.path() == w.file.path()) {
+            Some(got) => {
+                if got.wave != w.length_wave {
+                    return Err(StoreError::Corrupt("an append file has two length waves"));
+                }
+                got.end = got.end.max(w.new_logical);
+            }
+            None => files.push(Published {
+                file: w.file,
+                end: w.new_logical,
+                wave: w.length_wave,
+            }),
         }
     }
-    for (file, _) in &files {
-        file.sync_data_only()?;
+    if !files.is_empty() {
+        let refs: Vec<&TableFile> = files.iter().map(|f| f.file).collect();
+        TableFile::sync_data_all(&refs)?;
     }
     #[cfg(debug_assertions)]
     run_commit_hook()?;
-    for (file, end) in &files {
-        file.set_logical_len(*end)?;
-        file.flush()?;
+    let mut waves: Vec<u32> = files.iter().map(|f| f.wave).collect();
+    waves.sort_unstable();
+    waves.dedup();
+    for wave in waves {
+        let group: Vec<&TableFile> = files
+            .iter()
+            .filter(|f| f.wave == wave)
+            .map(|f| f.file)
+            .collect();
+        for f in files.iter().filter(|f| f.wave == wave) {
+            f.file.set_logical_len(f.end)?;
+        }
+        TableFile::sync_length_wave(&group)?;
     }
     Ok(())
 }

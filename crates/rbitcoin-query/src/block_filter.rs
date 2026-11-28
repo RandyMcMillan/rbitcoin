@@ -735,6 +735,20 @@ impl Query {
         built: &[(BlockFilter, Fk)],
     ) -> Result<u32, QueryError> {
         let _appender = self.bf_wb.lock_appender();
+        self.write_basic_filters(table, start, built, |recs| table.put(recs))
+    }
+
+    /// [`Self::commit_basic_filters`] without taking the appender lock.
+    ///
+    /// `commit` publishes the records. A return of 0 means the watermark or
+    /// `confirmed[h]` moved and `commit` was not called.
+    pub(crate) fn write_basic_filters(
+        &self,
+        table: &BlockFilterTable,
+        start: u32,
+        built: &[(BlockFilter, Fk)],
+        commit: impl FnOnce(&[BlockFilterRecord<'_>]) -> Result<(), StoreError>,
+    ) -> Result<u32, QueryError> {
         if table.next_height().0 != start {
             return Ok(0);
         }
@@ -768,7 +782,7 @@ impl Query {
             });
             prev = header;
         }
-        table.put(&recs)?;
+        commit(&recs)?;
         Ok(built.len() as u32)
     }
 

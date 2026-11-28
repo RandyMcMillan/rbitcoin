@@ -32,6 +32,7 @@ use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
 use crate::page_guard::{self, Append};
 use crate::seg_pair::{locate, SegDirs, SegPair};
+use crate::sp_tweaks::{SpTweaksTable, StagedBlocks};
 use rbitcoin_primitives::{bytes, le_u32, le_u64, Fk, Height, TableKind};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
@@ -488,6 +489,19 @@ impl BlockFilterTable {
     /// commit is done. Only then does the write lock publish the new pairs,
     /// slot counts, and tail. A failed put leaves readers on the old prefix.
     pub fn put(&self, items: &[BlockFilterRecord<'_>]) -> Result<(), StoreError> {
+        self.put_with(items, page_guard::commit_appends)
+    }
+
+    /// [`Self::put`], with `commit` publishing the planned appends.
+    ///
+    /// The filter writer is held across `commit`. A tweak stage held by
+    /// `commit` was locked first, so the pair seal does not invert that order.
+    #[doc(hidden)]
+    pub fn put_with(
+        &self,
+        items: &[BlockFilterRecord<'_>],
+        commit: impl FnOnce(&[Append<'_>]) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
         let _writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         self.refuse_after_failed_put()?;
         struct Plan {
@@ -578,6 +592,7 @@ impl BlockFilterTable {
                         at: p.body_at,
                         bytes: &p.body,
                         new_logical: p.body_end,
+                        length_wave: 0,
                     });
                 }
                 writes.push(Append {
@@ -585,11 +600,12 @@ impl BlockFilterTable {
                     at: p.idx_at,
                     bytes: &p.idx,
                     new_logical: p.idx_at + p.idx.len() as u64,
+                    length_wave: 1,
                 });
             }
-            // Body before idx in each plan, so a body length is durable
-            // before the idx length that names its records.
-            let committed = page_guard::commit_appends(&writes);
+            // Body wave 0, idx wave 1. `commit` may add the tweak pair on
+            // those same waves, so both bodies sync before either idx length.
+            let committed = commit(&writes);
             drop(writes);
             // A length may be durable already, including a rolled pair's.
             // The failed group is poisoned: leave the files for reopen and
@@ -648,4 +664,40 @@ impl BlockFilterTable {
         self.dirs.drop_after(&mut inner.segs, si + 1);
         Ok(())
     }
+}
+
+/// Publish filter appends and an already staged tweak plan in one commit.
+///
+/// Both bodies are length wave 0 and both indexes are wave 1.
+#[doc(hidden)]
+pub fn commit_filters_with_tweaks(
+    filters: &BlockFilterTable,
+    filter_items: &[BlockFilterRecord<'_>],
+    staged: &StagedBlocks<'_>,
+) -> Result<(), StoreError> {
+    filters.put_with(filter_items, |filter_writes| {
+        let tweaks = staged.appends();
+        let mut writes = Vec::with_capacity(filter_writes.len() + tweaks.len());
+        writes.extend_from_slice(filter_writes);
+        writes.extend(tweaks);
+        page_guard::commit_appends(&writes)
+    })
+}
+
+/// Plan tweaks, then [`commit_filters_with_tweaks`].
+///
+/// The tweak lock is taken before the filter writer.
+#[doc(hidden)]
+pub fn seal_filter_and_tweak_puts(
+    filters: &BlockFilterTable,
+    filter_items: &[BlockFilterRecord<'_>],
+    tweaks: &SpTweaksTable,
+    tweak_items: &[(Height, &[Option<[u8; 33]>])],
+) -> Result<(), StoreError> {
+    let staged = tweaks.stage_blocks(tweak_items)?;
+    let result = commit_filters_with_tweaks(filters, filter_items, &staged);
+    if result.is_ok() {
+        staged.committed();
+    }
+    result
 }

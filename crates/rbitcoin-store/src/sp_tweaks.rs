@@ -56,6 +56,101 @@ pub struct Inner {
     pub segs: Vec<Seg>,
 }
 
+struct TweakPlan {
+    si: usize,
+    body_at: u64,
+    body: Vec<u8>,
+    idx_at: u64,
+    idx: Vec<u8>,
+    n: u64,
+}
+
+/// Tweaks planned into RAM slot counts, not yet synced.
+///
+/// Drop undoes the counts unless [`Self::committed`] ran. The guard is the
+/// table lock, so the planned bytes stay the ones [`Self::appends`] names.
+#[doc(hidden)]
+pub struct StagedBlocks<'a> {
+    inner: Option<std::sync::MutexGuard<'a, Inner>>,
+    plans: Vec<TweakPlan>,
+    keep: bool,
+}
+
+impl<'a> StagedBlocks<'a> {
+    fn empty() -> Self {
+        Self {
+            inner: None,
+            plans: Vec::new(),
+            keep: true,
+        }
+    }
+
+    fn armed(inner: std::sync::MutexGuard<'a, Inner>, plans: Vec<TweakPlan>) -> Self {
+        Self {
+            inner: Some(inner),
+            plans,
+            keep: false,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn appends(&self) -> Vec<Append<'_>> {
+        let Some(inner) = self.inner.as_ref() else {
+            return Vec::new();
+        };
+        let mut writes = Vec::new();
+        for plan in &self.plans {
+            let seg = &inner.segs[plan.si];
+            if !plan.body.is_empty() {
+                writes.push(Append {
+                    file: &seg.body,
+                    at: plan.body_at,
+                    bytes: &plan.body,
+                    new_logical: plan.body_at + plan.body.len() as u64,
+                    length_wave: 0,
+                });
+            }
+            if !plan.idx.is_empty() {
+                writes.push(Append {
+                    file: &seg.idx,
+                    at: plan.idx_at,
+                    bytes: &plan.idx,
+                    new_logical: plan.idx_at + plan.idx.len() as u64,
+                    length_wave: 1,
+                });
+            }
+        }
+        writes
+    }
+
+    #[doc(hidden)]
+    pub fn committed(mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for StagedBlocks<'_> {
+    fn drop(&mut self) {
+        if self.keep {
+            return;
+        }
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
+        for plan in &self.plans {
+            if plan.si < inner.segs.len() {
+                inner.segs[plan.si].n_slots = inner.segs[plan.si].n_slots.saturating_sub(plan.n);
+            }
+        }
+        for plan in &self.plans {
+            let seg = &mut inner.segs[plan.si];
+            if seg.body.logical_len() > plan.body_at {
+                seg.read_end = Some(plan.body_at);
+            }
+        }
+    }
+}
+
 /// Height-dense thin tweak table (tip / strong heights only).
 pub struct SpTweaksTable {
     pub dirs: SegDirs,
@@ -461,8 +556,24 @@ impl SpTweaksTable {
     /// Idx `off` is the record **start**. A blob may extend past `u32::MAX`;
     /// when the next start would not fit in `u32`, we roll a new segment.
     pub fn put_blocks(&self, items: &[(Height, &[Option<[u8; 33]>])]) -> Result<(), StoreError> {
+        let staged = self.stage_blocks(items)?;
+        let result = {
+            let writes = staged.appends();
+            page_guard::commit_appends(&writes)
+        };
+        if result.is_ok() {
+            staged.committed();
+        }
+        result
+    }
+
+    #[doc(hidden)]
+    pub fn stage_blocks<'a>(
+        &'a self,
+        items: &[(Height, &[Option<[u8; 33]>])],
+    ) -> Result<StagedBlocks<'a>, StoreError> {
         if items.is_empty() {
-            return Ok(());
+            return Ok(StagedBlocks::empty());
         }
         let mut expect = self.next_height();
         for (h, _) in items {
@@ -477,20 +588,12 @@ impl SpTweaksTable {
         let mut inner = self.lock();
         Self::refuse_after_failed_put(&inner)?;
         let mut i = 0usize;
-        struct Plan {
-            si: usize,
-            body_at: u64,
-            body: Vec<u8>,
-            idx_at: u64,
-            idx: Vec<u8>,
-            n: u64,
-        }
-        let mut plans: Vec<Plan> = Vec::new();
+        let mut plans: Vec<TweakPlan> = Vec::new();
         // `roll` stamps `first_slot` from `n_slots` already on the pairs.
         // Count a plan when it is pushed so a later roll in this batch does
         // not overlap the segment it just left. A failed commit subtracts
         // those counts again.
-        fn undo_slot_plan(segs: &mut [Seg], plans: &[Plan]) {
+        fn undo_slot_plan(segs: &mut [Seg], plans: &[TweakPlan]) {
             for p in plans {
                 if p.si < segs.len() {
                     segs[p.si].n_slots = segs[p.si].n_slots.saturating_sub(p.n);
@@ -547,7 +650,7 @@ impl SpTweaksTable {
             for o in &offs {
                 idx.extend_from_slice(&o.to_le_bytes());
             }
-            plans.push(Plan {
+            plans.push(TweakPlan {
                 si,
                 body_at: start,
                 body,
@@ -557,47 +660,9 @@ impl SpTweaksTable {
             });
             inner.segs[si].n_slots = inner.segs[si].n_slots.saturating_add(n);
         }
-        let mut writes: Vec<Append<'_>> = Vec::new();
-        for p in &plans {
-            let seg = &inner.segs[p.si];
-            if !p.body.is_empty() {
-                writes.push(Append {
-                    file: &seg.body,
-                    at: p.body_at,
-                    bytes: &p.body,
-                    new_logical: p.body_at + p.body.len() as u64,
-                });
-            }
-            if !p.idx.is_empty() {
-                writes.push(Append {
-                    file: &seg.idx,
-                    at: p.idx_at,
-                    bytes: &p.idx,
-                    new_logical: p.idx_at + p.idx.len() as u64,
-                });
-            }
-        }
-        // Body before idx in each plan, so a body length is durable before
-        // the idx length that names its records.
-        let committed = page_guard::commit_appends(&writes);
-        drop(writes);
-        if let Err(e) = committed {
-            // A length may be durable already, including a rolled pair's, so
-            // the files stay as the commit left them for reopen and its
-            // last-record fit. Readers keep the old prefix: take the planned
-            // slots back out of the counts. The old last record ends at the
-            // body length, which may now name the put's bytes, so readers end
-            // it at the old length in RAM only.
-            undo_slot_plan(&mut inner.segs, &plans);
-            for p in &plans {
-                let seg = &mut inner.segs[p.si];
-                if seg.body.logical_len() > p.body_at {
-                    seg.read_end = Some(p.body_at);
-                }
-            }
-            return Err(e);
-        }
-        Ok(())
+        // A failed commit undoes these counts. Body wave 0 and idx wave 1
+        // share one `commit_appends` with the filter pair when both seal.
+        Ok(StagedBlocks::armed(inner, plans))
     }
 
     /// `None` = not indexed (below origin or past next).

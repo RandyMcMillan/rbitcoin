@@ -747,3 +747,66 @@ fn open_keeps_a_pair_whose_files_it_cannot_stat() {
     let t = BlockFilterTable::open(&dir).unwrap();
     assert_eq!(t.next_height(), Height(3));
 }
+
+/// A filter put and a tweak put in one seal share three barriers. Both body
+/// lengths are in their headers before either idx length is written.
+#[cfg(debug_assertions)]
+#[test]
+fn a_filter_and_tweak_seal_is_three_barriers() {
+    use rbitcoin_store::sp_tweaks::SpTweaksTable;
+    let dir = tmp_dir();
+    let filters = BlockFilterTable::open_or_create(&dir).unwrap();
+    let tweaks = SpTweaksTable::create(&dir, Height(0)).unwrap();
+    let filter_dirs = BlockFilterTable::seg_dirs(&dir);
+    let paths = vec![
+        filter_dirs.body_path(0),
+        filter_dirs.idx_path(0),
+        SpTweaksTable::body_dir(&dir).join("000000"),
+        SpTweaksTable::idx_dir(&dir).join("000000"),
+    ];
+    let body = vec![1u8, 2, 3];
+    let recs = [BlockFilterRecord {
+        height: Height(0),
+        slot: slot(0),
+        filter: &body,
+    }];
+    let mut tweak = [0u8; 33];
+    tweak[0] = 0x02;
+    let row = [Some(tweak)];
+    let items = [(Height(0), row.as_slice())];
+    rbitcoin_store::file::arm_sync_barrier_trace(&paths);
+    seal_filter_and_tweak_puts(&filters, &recs, &tweaks, &items).unwrap();
+    let barriers = rbitcoin_store::file::take_sync_barrier_trace();
+    assert_eq!(barriers.len(), 3, "{barriers:?}");
+    let names = |synced: &[std::path::PathBuf]| {
+        let mut names: Vec<_> = synced
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(barriers[0].synced.len(), 4, "{barriers:?}");
+    assert!(
+        barriers[0]
+            .headers
+            .iter()
+            .all(|(_, len)| *len == FILE_HEADER_LEN as u64),
+        "payload barrier wrote a length: {:?}",
+        barriers[0].headers
+    );
+    assert_eq!(names(&barriers[1].synced).len(), 2);
+    assert_eq!(names(&barriers[2].synced).len(), 2);
+    let old = FILE_HEADER_LEN as u64;
+    let idx_still_old = barriers[1]
+        .headers
+        .iter()
+        .filter(|(path, _)| path.ends_with("000000") && path.to_string_lossy().contains(".idx"))
+        .all(|(_, len)| *len == old);
+    assert!(
+        idx_still_old,
+        "an idx length moved with the bodies: {barriers:?}"
+    );
+    assert_eq!(filters.next_height(), Height(1));
+    assert_eq!(tweaks.next_height(), Height(1));
+}

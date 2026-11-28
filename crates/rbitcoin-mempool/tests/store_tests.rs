@@ -2088,9 +2088,9 @@ fn compact_refuses_after_a_failed_mark_dir_sync() {
     fail_next_mark_dir_sync(&guard);
     assert!(mp.sync_deaths().is_err());
     assert!(!guard.join("flush").exists());
-    assert!(
-        mp.compact().is_err(),
-        "a compact installed over latched files"
-    );
+    let err = mp
+        .compact()
+        .expect_err("a compact installed over latched files");
+    assert!(err.to_string().contains("not durable"), "{err}");
     let _ = fs::remove_dir_all(&dir);
 }

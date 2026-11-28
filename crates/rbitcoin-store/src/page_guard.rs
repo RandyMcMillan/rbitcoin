@@ -664,6 +664,9 @@ pub(crate) fn published_sh_mark(name: &str) -> bool {
 /// directory that holds `rel`.
 #[doc(hidden)]
 pub fn drop_sh_rel(dir: &Path, rel: &str) -> Result<(), StoreError> {
+    // A retry that finds no mark naming `rel` must not let the caller's
+    // rename replace a file an earlier failed drop latched.
+    refuse_if_latched(&dir.join(rel))?;
     let guard = dir.join("guard");
     let rd = match std::fs::read_dir(&guard) {
         Ok(rd) => rd,

@@ -981,6 +981,9 @@ impl Mempool {
         }
         let slots_path = self.dir.join("slots");
         let slots_tmp = self.dir.join("slots.tmp");
+        if latched(&slots_path) || latched(&slots_tmp) {
+            return;
+        }
         if fs::rename(&slots_tmp, &slots_path).is_ok() {
             self.slots_pending = false;
         }
@@ -1389,7 +1392,7 @@ impl Mempool {
         // a failed clear unlinked may still be named on disk: those files
         // latched, and the packed names do not replace them.
         restore_mempool_mark(&self.dir)?;
-        for name in ["tx.body", "slots", "meta"] {
+        for name in ["tx.body", "slots", "slots.tmp", "meta"] {
             rbitcoin_store::page_guard::refuse_if_latched(&self.dir.join(name))
                 .map_err(map_store)?;
         }
@@ -1729,9 +1732,17 @@ pub fn finish_pending_compact(dir: &Path) -> Result<(), MempoolError> {
     let body_tmp = dir.join("tx.body.tmp");
     let slots_tmp = dir.join("slots.tmp");
     if !body_tmp.exists() && slots_tmp.exists() {
+        for path in [&slots_tmp, &dir.join("slots")] {
+            rbitcoin_store::page_guard::refuse_if_latched(path).map_err(map_store)?;
+        }
         fs::rename(&slots_tmp, dir.join("slots")).map_err(|e| MempoolError::io(dir, e))?;
     }
     Ok(())
+}
+
+/// A failed `guard/` sync latched `path`; leave it in place until restart.
+fn latched(path: &Path) -> bool {
+    rbitcoin_store::page_guard::refuse_if_latched(path).is_err()
 }
 
 #[doc(hidden)]

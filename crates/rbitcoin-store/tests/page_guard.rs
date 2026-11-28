@@ -10,6 +10,19 @@ use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
+/// `r` is the refusal a latched file returns.
+fn assert_latched<T: std::fmt::Debug>(r: Result<T, StoreError>, why: &str) {
+    match r {
+        Err(StoreError::Rejected(msg)) => {
+            assert_eq!(
+                msg, "a guard mark change for this file is not durable",
+                "{why}"
+            )
+        }
+        other => panic!("{why}: {other:?}"),
+    }
+}
+
 const PAGE: usize = 4096;
 
 fn fill(byte: u8) -> Vec<u8> {
@@ -879,9 +892,9 @@ fn clear_sh_marks_retry_keeps_the_file_latched() {
         "the file took a write before the unlink was durable"
     );
     clear_sh_marks(dir.path()).unwrap();
-    assert!(
-        file.write_at(PAGE as u64, &[0x77; 16]).is_err(),
-        "a retry does not release a latched file"
+    assert_latched(
+        file.write_at(PAGE as u64, &[0x77; 16]),
+        "a retry does not release a latched file",
     );
 }
 
@@ -903,9 +916,9 @@ fn restore_sh_marks_retry_with_no_mark_keeps_the_file_latched() {
         "the file took a write before the unlink was durable"
     );
     rbitcoin_store::page_guard::restore_sh_marks(dir.path()).unwrap();
-    assert!(
-        file.write_at(PAGE as u64, &[0x77; 16]).is_err(),
-        "a retry does not release a latched file"
+    assert_latched(
+        file.write_at(PAGE as u64, &[0x77; 16]),
+        "a retry does not release a latched file",
     );
 }
 
@@ -928,15 +941,16 @@ fn restore_fit_retry_with_no_mark_keeps_the_file_latched() {
         "the file took a write before the unlink was durable"
     );
     assert!(!restore_page_guard_group_fit(&mark, dir.path()).unwrap());
-    assert!(
-        file.write_at(PAGE as u64, &[0x77; 16]).is_err(),
-        "a retry does not release a latched file"
+    assert_latched(
+        file.write_at(PAGE as u64, &[0x77; 16]),
+        "a retry does not release a latched file",
     );
 }
 
 /// `drop_sh_rel` drops the only name in the last `sh-*` mark, so the mark is
 /// unlinked, and then the `guard/` sync fails, which latches the file. A
-/// retry finds no mark and leaves the file latched until restart.
+/// retry refuses, so the caller's rename cannot replace that file, and the
+/// file stays latched until restart.
 #[cfg(all(unix, debug_assertions))]
 #[test]
 fn drop_sh_rel_retry_with_no_mark_keeps_the_file_latched() {
@@ -951,10 +965,13 @@ fn drop_sh_rel_retry_with_no_mark_keeps_the_file_latched() {
         file.write_at(PAGE as u64 + 256, &[0x44; 16]).is_err(),
         "the file took a write before the unlink was durable"
     );
-    rbitcoin_store::page_guard::drop_sh_rel(dir.path(), "body").unwrap();
-    assert!(
-        file.write_at(PAGE as u64, &[0x77; 16]).is_err(),
-        "a retry does not release a latched file"
+    assert_latched(
+        rbitcoin_store::page_guard::drop_sh_rel(dir.path(), "body"),
+        "a retry refuses a name an earlier drop latched, so no rename replaces it",
+    );
+    assert_latched(
+        file.write_at(PAGE as u64, &[0x77; 16]),
+        "a retry does not release a latched file",
     );
 }
 
@@ -977,9 +994,9 @@ fn restore_retry_with_no_mark_keeps_the_file_latched() {
         "the restored file is open before the unlink is durable"
     );
     assert!(!restore_page_guard_group(&mark, dir.path()).unwrap());
-    assert!(
-        rbitcoin_store::page_guard::check_armed_write(&live, PAGE as u64, 256, 512).is_err(),
-        "a retry does not release a latched file"
+    assert_latched(
+        rbitcoin_store::page_guard::check_armed_write(&live, PAGE as u64, 256, 512),
+        "a retry does not release a latched file",
     );
 }
 
@@ -1004,9 +1021,9 @@ fn clear_sh_marks_latches_an_earlier_unlink_when_a_later_one_fails() {
     );
     std::fs::remove_dir(guard.join("sh-b")).unwrap();
     clear_sh_marks(dir.path()).unwrap();
-    assert!(
-        file.write_at(PAGE as u64, &[0x77; 16]).is_err(),
-        "a retry does not release a latched file"
+    assert_latched(
+        file.write_at(PAGE as u64, &[0x77; 16]),
+        "a retry does not release a latched file",
     );
 }
 
@@ -1028,9 +1045,9 @@ fn clear_rel_retry_with_no_mark_keeps_the_file_latched() {
         "the file took a write before the unlink was durable"
     );
     clear_page_guard_rel(&mark, dir.path(), &files).unwrap();
-    assert!(
-        file.write_at(PAGE as u64, &[0x77; 16]).is_err(),
-        "a retry does not release a latched file"
+    assert_latched(
+        file.write_at(PAGE as u64, &[0x77; 16]),
+        "a retry does not release a latched file",
     );
 }
 
@@ -1066,17 +1083,14 @@ fn a_removed_mark_latches_its_file_when_the_dir_sync_fails() {
     assert!(check(PAGE as u64 + 256).is_err());
     check(committed).expect("an append stays allowed");
     clear_page_guard(&mark, &file, &live).unwrap();
-    assert!(
-        check(256).is_err(),
-        "a retry does not release a latched file"
+    assert_latched(check(256), "a retry does not release a latched file");
+    assert_latched(
+        check(PAGE as u64 + 256),
+        "a retry does not release a latched file",
     );
-    assert!(
-        check(PAGE as u64 + 256).is_err(),
-        "a retry does not release a latched file"
-    );
-    assert!(
-        arm_page_guard_group(&mark, &[("live", 0, fill(0x11).as_slice())]).is_err(),
-        "a latched file takes no new arm"
+    assert_latched(
+        arm_page_guard_group(&mark, &[("live", 0, fill(0x11).as_slice())]),
+        "a latched file takes no new arm",
     );
 }
 
@@ -1114,10 +1128,7 @@ fn a_dropped_file_latches_when_the_rewrite_sync_fails() {
     );
     check(&b).expect("b is still armed");
     clear_page_guard(&mark, &file, &a).unwrap();
-    assert!(
-        check(&a).is_err(),
-        "a retry does not release a latched file"
-    );
+    assert_latched(check(&a), "a retry does not release a latched file");
 }
 
 /// A restore whose mark unlink fails its directory sync blocks the files it
@@ -1199,13 +1210,13 @@ fn a_rewritten_mark_blocks_dropped_pages_when_the_dir_sync_fails() {
         other => panic!("`live` is open before the rewrite is durable: {other:?}"),
     }
     assert!(check(PAGE as u64).is_err());
-    assert!(
-        arm_page_guard_group(&mark, &[("live", PAGE as u64, fill(0x12).as_slice())]).is_err(),
-        "a latched file takes no new arm"
+    assert_latched(
+        arm_page_guard_group(&mark, &[("live", PAGE as u64, fill(0x12).as_slice())]),
+        "a latched file takes no new arm",
     );
-    assert!(
-        check(PAGE as u64).is_err(),
-        "a retry does not release a latched file"
+    assert_latched(
+        check(PAGE as u64),
+        "a retry does not release a latched file",
     );
 }
 

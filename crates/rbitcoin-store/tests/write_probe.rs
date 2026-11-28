@@ -82,7 +82,8 @@ fn footer(path: &Path, durable: u64, new: u64) -> Landing {
         path,
         durable,
         new - footer,
-        &new.to_le_bytes(),
+        // The whole footer, as `write_trailer` writes it: it ends at `new`.
+        &[0; TRAILING_FOOTER_LEN],
         true,
         0,
         WriteKind::Length,
@@ -138,4 +139,68 @@ fn a_synced_length_with_no_mark_on_its_bytes_stays_safe() {
         publish(&path, 2 * page, 2 * page + 100),
         Some("LEN_AFTER_SYNC")
     );
+}
+
+#[test]
+fn a_stale_sync_does_not_replace_a_newer_durable_footer() {
+    let path = probe_path("footer-stale-sync");
+    opened_trailing(&path, 100);
+    let stale = sync_begin(&path);
+    footer(&path, 100, 200).landed();
+    full_sync(&path);
+    synced(&path, stale);
+    let (class, durable, _landing) = classify(&path, 0, 150, &[0; 10], true, 0, WriteKind::Payload);
+    assert_eq!((class, durable), (Some("ONE_SECTOR"), 200));
+}
+
+fn footer_class(path: &Path, durable: u64, new: u64) -> Option<&'static str> {
+    let footer = TRAILING_FOOTER_LEN as u64;
+    classify(
+        path,
+        durable,
+        new - footer,
+        // The whole footer, as `write_trailer` writes it: it ends at `new`.
+        &[0; TRAILING_FOOTER_LEN],
+        true,
+        0,
+        WriteKind::Length,
+    )
+    .0
+}
+
+#[test]
+fn a_growing_footer_across_a_sector_is_not_safe_after_its_payload_syncs() {
+    let path = probe_path("footer-two-sectors");
+    opened_trailing(&path, 32);
+    drop(classify(
+        &path,
+        0,
+        0,
+        &[0; 496],
+        true,
+        0,
+        WriteKind::Payload,
+    ));
+    full_sync(&path);
+    assert_eq!(footer_class(&path, 32, 528), Some("LEN_MULTI_SECTOR"));
+    // A mark that images the footer's page restores it whole.
+    probe_arm_for_test(&path, &[0]);
+    assert_eq!(footer_class(&path, 32, 528), Some("LEN_AFTER_SYNC"));
+}
+
+#[test]
+fn a_growing_footer_in_one_sector_is_safe_after_its_payload_syncs() {
+    let path = probe_path("footer-one-sector");
+    opened_trailing(&path, 32);
+    drop(classify(
+        &path,
+        0,
+        0,
+        &[0; 400],
+        true,
+        0,
+        WriteKind::Payload,
+    ));
+    full_sync(&path);
+    assert_eq!(footer_class(&path, 32, 432), Some("LEN_AFTER_SYNC"));
 }

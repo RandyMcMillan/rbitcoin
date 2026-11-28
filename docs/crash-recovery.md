@@ -263,7 +263,9 @@ length that names bytes on pages the file's live mark images, when that
 mark does not image the length too, is `LEN_ON_MARK`: a restore rewrites
 those pages from the mark's images and keeps the length, so whether the
 named bytes survive depends on what the mark holds. It is never safe by
-structure. A trailing table
+structure. A length whose own write (a trailing footer) spans two sectors
+with no mark over it is `LEN_MULTI_SECTOR`, even when the bytes it names
+are synced: the footer itself can land torn. A trailing table
 opened from disk starts from its footer as its durable end. `scripts/write-probe-classify.py` passes the classes that are safe
 by structure and fails CI on any other entry without a reviewed reason in
 its rule list: a Class A length past the synced floor, the `spent.body`

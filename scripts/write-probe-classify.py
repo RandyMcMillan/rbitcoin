@@ -16,6 +16,8 @@ import sys
 # (a table built bare in a test). LEN_ON_MARK is never safe by structure: a
 # length that names bytes on pages a live mark images, with the length
 # itself outside that mark, survives a restore that rewrites those bytes.
+# LEN_MULTI_SECTOR is a length write (a trailing footer) that spans two
+# sectors with no mark over it: it can land torn even after its bytes sync.
 SAFE = {"CREATE", "ARMED", "ONE_SECTOR", "LEN_ONE_SECTOR", "LEN_ARMED",
         "LEN_AFTER_SYNC", "FIXTURE"}
 

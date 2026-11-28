@@ -44,7 +44,7 @@ fn dirty() -> &'static Mutex<HashMap<PathBuf, Dirty>> {
 #[doc(hidden)]
 pub struct SyncPoint {
     seq: u64,
-    trailer: Option<u64>,
+    trailer: Option<(u64, u64)>,
 }
 
 /// A sync covers only the writes that landed before it began. A write that
@@ -59,14 +59,15 @@ pub fn sync_begin(path: &Path) -> SyncPoint {
     let trailer = trailers()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .0
+        .written
         .get(path)
         .copied();
     SyncPoint { seq, trailer }
 }
 
 /// A sync that began at `at` finished: the writes and trailer it covered are
-/// durable.
+/// durable. A trailer older than the durable one, by version, stays behind
+/// it: a sync that began earlier can finish after a later one.
 #[doc(hidden)]
 pub fn synced(path: &Path, at: SyncPoint) {
     if let Some(d) = dirty()
@@ -76,12 +77,11 @@ pub fn synced(path: &Path, at: SyncPoint) {
     {
         d.ranges.retain(|&(seq, _, _)| seq >= at.seq);
     }
-    if let Some(end) = at.trailer {
-        trailers()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .1
-            .insert(path.to_path_buf(), end);
+    if let Some((version, end)) = at.trailer {
+        let mut t = trailers().lock().unwrap_or_else(|e| e.into_inner());
+        if t.durable.get(path).is_none_or(|&(have, _)| have < version) {
+            t.durable.insert(path.to_path_buf(), (version, Some(end)));
+        }
     }
 }
 
@@ -91,25 +91,50 @@ pub fn synced(path: &Path, at: SyncPoint) {
 #[doc(hidden)]
 pub fn opened_trailing(path: &Path, end: u64) {
     let mut t = trailers().lock().unwrap_or_else(|e| e.into_inner());
-    if t.0.contains_key(path) || t.1.contains_key(path) {
+    if t.written.contains_key(path) || t.durable_end(path).is_some() {
         return;
     }
-    t.0.insert(path.to_path_buf(), end);
-    t.1.insert(path.to_path_buf(), end);
+    let version = t.version();
+    t.written.insert(path.to_path_buf(), (version, end));
+    t.durable.insert(path.to_path_buf(), (version, Some(end)));
 }
 
 /// A trailing table created at `path` has no durable end yet, whatever an
 /// earlier file at that path had.
 pub(crate) fn created_trailing(path: &Path) {
     let mut t = trailers().lock().unwrap_or_else(|e| e.into_inner());
-    t.0.remove(path);
-    t.1.remove(path);
+    t.written.remove(path);
+    // A newer version with no end: a sync that began on the old file is stale.
+    let version = t.version();
+    t.durable.insert(path.to_path_buf(), (version, None));
 }
 
-/// (last trailer end written, last trailer end a sync covered) per file.
-fn trailers() -> &'static Mutex<(HashMap<PathBuf, u64>, HashMap<PathBuf, u64>)> {
-    static T: OnceLock<Mutex<(HashMap<PathBuf, u64>, HashMap<PathBuf, u64>)>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new((HashMap::new(), HashMap::new())))
+/// Trailer ends per file, each with the version it took when observed.
+/// Versions only grow, so a stale sync is told apart from a footer that
+/// shrank the file.
+#[derive(Default)]
+struct Trailers {
+    next: u64,
+    /// The last trailer written.
+    written: HashMap<PathBuf, (u64, u64)>,
+    /// The last trailer a sync covered. `None` is a created file.
+    durable: HashMap<PathBuf, (u64, Option<u64>)>,
+}
+
+impl Trailers {
+    fn version(&mut self) -> u64 {
+        self.next += 1;
+        self.next
+    }
+
+    fn durable_end(&self, path: &Path) -> Option<u64> {
+        self.durable.get(path).and_then(|&(_, end)| end)
+    }
+}
+
+fn trailers() -> &'static Mutex<Trailers> {
+    static T: OnceLock<Mutex<Trailers>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(Trailers::default()))
 }
 
 /// Class A stems can live in a cold directory with no `meta` beside them.
@@ -180,11 +205,9 @@ impl Drop for Landing {
             }
         }
         if let Some(end) = self.trailer.filter(|_| self.ok) {
-            trailers()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .0
-                .insert(self.path.clone(), end);
+            let mut t = trailers().lock().unwrap_or_else(|e| e.into_inner());
+            let version = t.version();
+            t.written.insert(self.path.clone(), (version, end));
         }
     }
 }
@@ -254,7 +277,7 @@ pub fn classify(
     // sync covered.
     let committed = if trailing {
         let t = trailers().lock().unwrap_or_else(|e| e.into_inner());
-        t.1.get(path).copied().unwrap_or(header_len)
+        t.durable_end(path).unwrap_or(header_len)
     } else {
         header_on_file(path).unwrap_or(committed)
     };
@@ -307,6 +330,12 @@ pub fn classify(
             Some("LEN_ONE_SECTOR")
         } else if !named_safe {
             Some("LEN_BEFORE_SYNC")
+        } else if offset / SECTOR != (end - 1) / SECTOR
+            && !crate::page_guard::probe_armed_covers(path, offset, len)
+        {
+            // The named bytes are synced, but the length itself (a trailing
+            // footer) spans two sectors with no mark, and can land torn.
+            Some("LEN_MULTI_SECTOR")
         } else {
             Some("LEN_AFTER_SYNC")
         }

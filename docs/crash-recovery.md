@@ -94,12 +94,15 @@ left half applied. `handle_pwrite_all` retries a short `pwrite` for the
 bytes it did not write, so a cell can only stay half new if the kernel takes
 part of it and the retry then fails, or the process stops between the two
 writes. A crash there keeps the half-new cell on the device, so open relies
-on this rule as well as the sector rule. The triggers would be a file-size limit
-(`RLIMIT_FSIZE`) or a copy-on-write filesystem out of space on an overwrite,
-landing inside an aligned field of 8 or 16 bytes. Nothing checks for it: the
-8-byte length at offset 8 and the `txstat` cells rely on it, and a half-new
-`txstat` cell still decodes. The failed write returns an error, and the next
-stamp of that cell rewrites all of it.
+on this rule as well as the sector rule. The 8-byte length at offset 8 and
+the `txstat` cells rely on it, and a half-new `txstat` cell still decodes.
+Linux shortens a write at a file-size limit (`RLIMIT_FSIZE`) before it
+copies, interior overwrites included, so the one software way to split an
+aligned 8- or 16-byte field is a limit set to a byte offset inside it. A
+limit in whole KiB, as `ulimit -f` and systemd `LimitFSIZE=` set it, cannot
+split such a field, and the node sets none. A copy-on-write filesystem out
+of space has not been shown to split one. A drive that tears inside a
+sector can, and is outside the device contract below.
 
 This is the assumption storage engines with a single-sector commit record
 make and do not guard in software. PostgreSQL keeps `pg_control` within
@@ -150,9 +153,13 @@ The spend delta asks less of the device than these rules do. It never
 writes a 4 KiB block that holds bytes its commit names, so a block torn to
 zeroes loses nothing ([107](./external_findings/107-torn-spend-page.md)).
 That margin stays for the delta's I/O shape. The rest of the store does not
-rely on it: on a device that can tear a block it did not finish writing, a
-torn page 0 leaves a file that open refuses, and a torn tail block cuts
-rows an append shares it with.
+rely on it. On a device that can tear a block it did not finish writing, a
+torn tail block can change committed rows an append shares it with, not
+only cut them. Open catches that for `txid.body` rows in the blocks tip
+revalidation rechecks (it recomputes each merkle root) and for header rows
+near the tip (rehashed against the parent); elsewhere a changed row can be
+served. A torn page 0 is refused only when its magic, schema or kind bytes
+tore: a torn length that stays aligned and inside the file is trusted.
 
 Any other write that changes committed bytes in more than one sector goes
 through `page_guard`. The writer stores an image of every page that

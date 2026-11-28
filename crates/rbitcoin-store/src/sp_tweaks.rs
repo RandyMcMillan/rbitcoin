@@ -98,6 +98,7 @@ impl<'a> StagedBlocks<'a> {
         let Some(inner) = self.inner.as_ref() else {
             return Vec::new();
         };
+        let index_base = self.plans.first().map(|p| p.si).unwrap_or(0);
         let mut writes = Vec::new();
         for plan in &self.plans {
             let seg = &inner.segs[plan.si];
@@ -118,7 +119,7 @@ impl<'a> StagedBlocks<'a> {
                     bytes: &plan.idx,
                     new_logical: plan.idx_at + plan.idx.len() as u64,
                     length_wave: 1,
-                    length_order: seg.file_id,
+                    length_order: u32::try_from(plan.si - index_base).unwrap_or(u32::MAX),
                 });
             }
         }

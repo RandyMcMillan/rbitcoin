@@ -583,6 +583,7 @@ impl BlockFilterTable {
                     &rolled[si - inner.segs.len()]
                 }
             };
+            let index_base = plans.first().map(|p| p.si).unwrap_or(0);
             let mut writes: Vec<Append<'_>> = Vec::new();
             for p in &plans {
                 let seg = pair(p.si);
@@ -602,7 +603,7 @@ impl BlockFilterTable {
                     bytes: &p.idx,
                     new_logical: p.idx_at + p.idx.len() as u64,
                     length_wave: 1,
-                    length_order: seg.file_id,
+                    length_order: u32::try_from(p.si - index_base).unwrap_or(u32::MAX),
                 });
             }
             // Body wave 0, idx wave 1. `commit` may add the tweak pair on

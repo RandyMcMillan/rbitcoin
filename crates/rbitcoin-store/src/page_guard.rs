@@ -1043,9 +1043,10 @@ pub struct Append<'a> {
     /// written. Files that share a wave share one sync.
     pub length_wave: u32,
     /// Order inside one wave. A lower order is synced before a higher
-    /// order's lengths are written. A segment index uses its file id, so
-    /// the earlier pair's index length is durable before the next pair's
-    /// index length is written.
+    /// order's lengths are written. A segment index uses its place in
+    /// this commit, starting at 0 for the earliest segment the commit
+    /// writes. Two tables then share one sync until one of them writes
+    /// a later segment.
     pub length_order: u32,
 }
 

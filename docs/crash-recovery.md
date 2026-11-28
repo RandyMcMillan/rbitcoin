@@ -131,9 +131,10 @@ The kernel writes dirty pages back in commands of one page or more, so a
 command, including an append that shares its tail block with committed rows,
 can be larger than that unit. The specification promises nothing for such a
 command, and the sector rule then rests on the drive keeping each block it
-carries old or new. A 4 KiB format makes each block a whole page, so a block
-is never part old and part new across sectors; prefer it where the drive
-offers one. `nvme id-ctrl` shows `awupf`; `nvme id-ns` lists the formats, and
+carries old or new. A 4 KiB format makes each block a whole page; for a
+command above `AWUPF` the sector rule still depends on the drive keeping
+each block old or new, so the format is not a substitute for that behavior.
+Prefer a 4 KiB format where the drive offers one. `nvme id-ctrl` shows `awupf`; `nvme id-ns` lists the formats, and
 `nvme format --lbaf` changes it and erases the namespace.
 
 The flush is where consumer drives differ. In a 2022 test that wrote,

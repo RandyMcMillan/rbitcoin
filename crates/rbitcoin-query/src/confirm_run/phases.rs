@@ -347,6 +347,7 @@ pub fn structural_run(
     wire_blocks: &[Arc<Block>],
     batch_parents: &crate::BatchParents,
     abs_jobs: &[Vec<crate::block_pipeline::StructuralAbsJob>],
+    appended: &super::write::Appended,
     reuse: &mut StructuralReuse,
 ) -> Result<crate::block_pipeline::AnnotateSlots, ConfirmError> {
     use crate::block_pipeline::StructuralPhaseNs;
@@ -370,29 +371,46 @@ pub fn structural_run(
     }
     let mut tot = StructuralPhaseNs::default();
     let bip34_ancestor = bip34_ancestor_for_write(query, params, prepared);
-    // Each block reads its slice of this one prefetch.
-    reuse.scratch.meta_offs = abs_jobs
-        .iter()
-        .flatten()
-        .map(|&(_, _, abs, _, _)| abs)
-        .collect();
+    // Each block reads its slice of this one prefetch. A parent this batch
+    // appended has an empty slot, so that slot is not read. A parent this
+    // batch is only connecting again still has its slot.
+    let mut read_at = Vec::new();
+    for &(id, _, abs, _, _) in abs_jobs.iter().flatten() {
+        if !appended.contains(rbitcoin_primitives::Fk(id)) {
+            read_at.push(reuse.scratch.meta_offs.len());
+        }
+        reuse.scratch.meta_offs.push(abs);
+    }
     if !reuse.scratch.meta_offs.is_empty() {
-        let meta_backend = rbitcoin_store::spend_meta_backend();
-        let t_meta = Instant::now();
-        let (slots, io) = query
-            .store()
-            .get_spender_meta_at_abs_batch_backend(&reuse.scratch.meta_offs, meta_backend)
-            .map_err(ConfirmError::from)?;
+        let empty = Some((rbitcoin_primitives::Fk::NULL, 0, 0));
+        let mut slots = vec![empty; reuse.scratch.meta_offs.len()];
+        if !read_at.is_empty() {
+            let read_offs: Vec<u64> = read_at
+                .iter()
+                .map(|&i| reuse.scratch.meta_offs[i])
+                .collect();
+            let meta_backend = rbitcoin_store::spend_meta_backend();
+            let t_meta = Instant::now();
+            let (got, io) = query
+                .store()
+                .get_spender_meta_at_abs_batch_backend(&read_offs, meta_backend)
+                .map_err(ConfirmError::from)?;
+            if got.len() != read_offs.len() {
+                return Err(ConfirmError::Store(rbitcoin_store::StoreError::Corrupt(
+                    "invariant: structural meta batch length",
+                )));
+            }
+            for (&i, meta) in read_at.iter().zip(got) {
+                slots[i] = meta;
+            }
+            let meta_ns = t_meta.elapsed().as_nanos() as u64;
+            crate::note_confirm(&query.confirm_stats().spend_meta_read_bytes, io.read_bytes);
+            crate::note_confirm(&query.confirm_stats().spend_meta_kept_bytes, io.kept_bytes);
+            crate::note_confirm(&query.confirm_stats().spend_meta_ns, meta_ns);
+            let _ = meta_backend;
+        }
+        crate::note_confirm(&query.confirm_stats().spend_meta_n, read_at.len() as u64);
         reuse.scratch.meta_prefetch = slots;
-        let meta_ns = t_meta.elapsed().as_nanos() as u64;
-        crate::note_confirm(&query.confirm_stats().spend_meta_read_bytes, io.read_bytes);
-        crate::note_confirm(&query.confirm_stats().spend_meta_kept_bytes, io.kept_bytes);
-        crate::note_confirm(&query.confirm_stats().spend_meta_ns, meta_ns);
-        crate::note_confirm(
-            &query.confirm_stats().spend_meta_n,
-            reuse.scratch.meta_offs.len() as u64,
-        );
-        let _ = meta_backend;
     }
     reuse.scratch.meta_at = Some(0);
     for (i, p) in prepared.iter().enumerate() {

@@ -39,30 +39,34 @@ fn dirty() -> &'static Mutex<HashMap<PathBuf, Dirty>> {
     D.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// What a sync starting now covers: the writes made before it, and the last
-/// trailer written before it.
+/// What a sync starting now covers: the writes made before it, the last
+/// trailer written before it, and the leading header the file held then.
 #[doc(hidden)]
 pub struct SyncPoint {
     seq: u64,
     trailer: Option<(u64, u64)>,
+    header: Option<(u64, u64)>,
 }
 
 /// A sync covers only the writes that landed before it began. A write that
 /// lands while it waits, or is still in flight, is not covered by it.
+/// `header` is the leading header end the file holds now ([`header_on`]).
 #[doc(hidden)]
-pub fn sync_begin(path: &Path) -> SyncPoint {
+pub fn sync_begin(path: &Path, header: Option<u64>) -> SyncPoint {
     let seq = dirty()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(path)
         .map_or(0, |d| d.next);
-    let trailer = trailers()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .written
-        .get(path)
-        .copied();
-    SyncPoint { seq, trailer }
+    let mut t = ends().lock().unwrap_or_else(|e| e.into_inner());
+    let trailer = t.written.get(path).copied();
+    // A sync that begins later sees a header at least as new.
+    let header = header.map(|end| (t.version(), end));
+    SyncPoint {
+        seq,
+        trailer,
+        header,
+    }
 }
 
 /// A sync that began at `at` finished: the writes and trailer it covered are
@@ -77,12 +81,44 @@ pub fn synced(path: &Path, at: SyncPoint) {
     {
         d.ranges.retain(|&(seq, _, _)| seq >= at.seq);
     }
+    let mut t = ends().lock().unwrap_or_else(|e| e.into_inner());
     if let Some((version, end)) = at.trailer {
-        let mut t = trailers().lock().unwrap_or_else(|e| e.into_inner());
         if t.durable.get(path).is_none_or(|&(have, _)| have < version) {
             t.durable.insert(path.to_path_buf(), (version, Some(end)));
         }
     }
+    if let Some((version, end)) = at.header {
+        if t.header.get(path).is_none_or(|&(have, _)| have < version) {
+            t.header.insert(path.to_path_buf(), (version, Some(end)));
+        }
+    }
+}
+
+/// A leading-header table opened from disk: the header end it read is
+/// durable, unless the probe already has a record of the path.
+pub(crate) fn opened_leading(path: &Path, end: u64) {
+    let mut t = ends().lock().unwrap_or_else(|e| e.into_inner());
+    if t.header.contains_key(path) {
+        return;
+    }
+    let version = t.version();
+    t.header.insert(path.to_path_buf(), (version, Some(end)));
+}
+
+/// A leading-header table created at `path` has no durable header yet. A
+/// sync that began on an earlier file there is stale.
+pub(crate) fn created_leading(path: &Path) {
+    let mut t = ends().lock().unwrap_or_else(|e| e.into_inner());
+    let version = t.version();
+    t.header.insert(path.to_path_buf(), (version, None));
+}
+
+/// The leading header end `file` holds: bytes 8..16, read through the
+/// store's portable positional read.
+pub(crate) fn header_on(file: &std::fs::File, path: &Path) -> Option<u64> {
+    let mut b = [0u8; 8];
+    crate::file::handle_pread_all(file, path, 8, &mut b).ok()?;
+    Some(u64::from_le_bytes(b))
 }
 
 /// A trailing table opened from disk: its footer end is durable. Only a
@@ -90,7 +126,7 @@ pub fn synced(path: &Path, at: SyncPoint) {
 /// created and has not synced keeps no durable end.
 #[doc(hidden)]
 pub fn opened_trailing(path: &Path, end: u64) {
-    let mut t = trailers().lock().unwrap_or_else(|e| e.into_inner());
+    let mut t = ends().lock().unwrap_or_else(|e| e.into_inner());
     if t.written.contains_key(path) || t.durable_end(path).is_some() {
         return;
     }
@@ -102,26 +138,28 @@ pub fn opened_trailing(path: &Path, end: u64) {
 /// A trailing table created at `path` has no durable end yet, whatever an
 /// earlier file at that path had.
 pub(crate) fn created_trailing(path: &Path) {
-    let mut t = trailers().lock().unwrap_or_else(|e| e.into_inner());
+    let mut t = ends().lock().unwrap_or_else(|e| e.into_inner());
     t.written.remove(path);
     // A newer version with no end: a sync that began on the old file is stale.
     let version = t.version();
     t.durable.insert(path.to_path_buf(), (version, None));
 }
 
-/// Trailer ends per file, each with the version it took when observed.
-/// Versions only grow, so a stale sync is told apart from a footer that
-/// shrank the file.
+/// Trailer and leading header ends per file, each with the version it took
+/// when observed. Versions only grow, so a stale sync is told apart from a
+/// length that shrank the file.
 #[derive(Default)]
-struct Trailers {
+struct Ends {
     next: u64,
     /// The last trailer written.
     written: HashMap<PathBuf, (u64, u64)>,
     /// The last trailer a sync covered. `None` is a created file.
     durable: HashMap<PathBuf, (u64, Option<u64>)>,
+    /// The last leading header end a sync covered. `None` is a created file.
+    header: HashMap<PathBuf, (u64, Option<u64>)>,
 }
 
-impl Trailers {
+impl Ends {
     fn version(&mut self) -> u64 {
         self.next += 1;
         self.next
@@ -132,9 +170,9 @@ impl Trailers {
     }
 }
 
-fn trailers() -> &'static Mutex<Trailers> {
-    static T: OnceLock<Mutex<Trailers>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(Trailers::default()))
+fn ends() -> &'static Mutex<Ends> {
+    static T: OnceLock<Mutex<Ends>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(Ends::default()))
 }
 
 /// Class A stems can live in a cold directory with no `meta` beside them.
@@ -205,7 +243,7 @@ impl Drop for Landing {
             }
         }
         if let Some(end) = self.trailer.filter(|_| self.ok) {
-            let mut t = trailers().lock().unwrap_or_else(|e| e.into_inner());
+            let mut t = ends().lock().unwrap_or_else(|e| e.into_inner());
             let version = t.version();
             t.written.insert(self.path.clone(), (version, end));
         }
@@ -236,15 +274,6 @@ pub(crate) fn write(
     let (class, committed, landing) =
         classify(path, committed, offset, bytes, trailing, header_len, kind);
     if let Some(class) = class {
-        let stem = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| CLASS_A_STEMS.contains(&n));
-        let class = if stem || in_store(path) {
-            class
-        } else {
-            "FIXTURE"
-        };
         log(class, path, committed, offset, bytes.len() as u64);
     }
     landing
@@ -272,14 +301,19 @@ pub fn classify(
     if len == 0 {
         return (None, committed, landing);
     }
-    // The header in the file, not the RAM length: a publish moves RAM first.
     // A trailer moves with the length, so its durable end is the last one a
-    // sync covered.
-    let committed = if trailing {
-        let t = trailers().lock().unwrap_or_else(|e| e.into_inner());
-        t.durable_end(path).unwrap_or(header_len)
-    } else {
-        header_on_file(path).unwrap_or(committed)
+    // sync covered. A leading header: `committed` is the end the file holds
+    // now (a publish moves RAM first), and a crash can leave either it or
+    // the last synced end, so the longer one bounds the durable bytes. An
+    // unsynced shrink keeps the old end until a sync covers it.
+    let committed = {
+        let t = ends().lock().unwrap_or_else(|e| e.into_inner());
+        if trailing {
+            t.durable_end(path).unwrap_or(header_len)
+        } else {
+            let synced = t.header.get(path).and_then(|&(_, end)| end);
+            synced.map_or(committed, |end| end.max(committed))
+        }
     };
     let end = offset + len;
     let len_field = kind == WriteKind::Length;
@@ -349,6 +383,7 @@ pub fn classify(
     if !len_field {
         landing.payload = Some(note_pending(path, offset, end));
     }
+    let class = class.map(|class| if store_table(path) { class } else { "FIXTURE" });
     (class, committed, landing)
 }
 
@@ -364,6 +399,19 @@ fn in_place_class(path: &Path, offset: u64, len: u64) -> &'static str {
     }
 }
 
+/// A Class A stem, a file in a cold index directory, or a file in a store.
+/// A split store's cold directory has no `meta`, so its tables are named.
+fn store_table(path: &Path) -> bool {
+    let name_in = |p: Option<&Path>, names: &[&str]| {
+        p.and_then(Path::file_name)
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| names.contains(&n))
+    };
+    name_in(Some(path), &CLASS_A_STEMS)
+        || name_in(path.parent(), crate::store::COLD_INDEX_DIRS)
+        || in_store(path)
+}
+
 /// A store has `meta` beside its files, or beside their directory.
 fn in_store(path: &Path) -> bool {
     let dir = path.parent();
@@ -371,14 +419,6 @@ fn in_store(path: &Path) -> bool {
         || dir
             .and_then(Path::parent)
             .is_some_and(|d| d.join("meta").is_file())
-}
-
-fn header_on_file(path: &Path) -> Option<u64> {
-    use std::os::unix::fs::FileExt as _;
-    let f = std::fs::File::open(path).ok()?;
-    let mut b = [0u8; 8];
-    f.read_exact_at(&mut b, 8).ok()?;
-    Some(u64::from_le_bytes(b))
 }
 
 fn log(class: &str, path: &Path, committed: u64, offset: u64, len: u64) {

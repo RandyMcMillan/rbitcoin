@@ -266,8 +266,13 @@ named bytes survive depends on what the mark holds. It is never safe by
 structure. A length whose own write (a trailing footer) spans two sectors
 with no mark over it is `LEN_MULTI_SECTOR`, even when the bytes it names
 are synced: the footer itself can land torn. A trailing table
-opened from disk starts from its footer as its durable end. `scripts/write-probe-classify.py` passes the classes that are safe
-by structure and fails CI on any other entry without a reviewed reason in
+opened from disk starts from its footer as its durable end. A leading-header
+table's durable end is the longer of the header it holds now and the last
+header a sync covered, so a shrink keeps the old end until it is synced.
+Files outside any store are logged as fixtures; a split store's cold
+index directories (`blockfilter.*`, `sp_tweaks.*`) and the Class A stems
+keep their class. `scripts/write-probe-classify.py` passes the classes that
+are safe by structure and fails CI on any other entry without a reviewed reason in
 its rule list: a Class A length past the synced floor, the `spent.body`
 fold that open replays, a hash-checked filter repair, and the few writes a
 dirty flag or a fresh file covers. A new writer that needs a new rule gets

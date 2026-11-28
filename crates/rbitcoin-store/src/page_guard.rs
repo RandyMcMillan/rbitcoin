@@ -418,7 +418,10 @@ pub fn clear_page_guard_files(path: &Path, files: &[(&File, &Path)]) -> Result<(
     mark_parent(path)?;
     for (data, data_path) in files {
         #[cfg(feature = "write-probe")]
-        let probe_n = crate::write_probe::sync_begin(data_path);
+        let probe_n = crate::write_probe::sync_begin(
+            data_path,
+            crate::write_probe::header_on(data, data_path),
+        );
         data.durable_sync_data()
             .map_err(|e| StoreError::io(*data_path, e))?;
         #[cfg(feature = "write-probe")]
@@ -665,7 +668,10 @@ pub fn clear_page_guard_rel(
     mark_parent(mark)?;
     for (data, data_path) in files {
         #[cfg(feature = "write-probe")]
-        let probe_n = crate::write_probe::sync_begin(data_path);
+        let probe_n = crate::write_probe::sync_begin(
+            data_path,
+            crate::write_probe::header_on(data, data_path),
+        );
         data.durable_sync_data()
             .map_err(|e| StoreError::io(*data_path, e))?;
         #[cfg(feature = "write-probe")]
@@ -1210,14 +1216,4 @@ pub(crate) fn probe_armed_touches(path: &Path, offset: u64, len: u64) -> bool {
         page += PAGE;
     }
     false
-}
-
-/// Write probe tests: arm `pages` of `path` as a live mark would.
-#[cfg(feature = "write-probe")]
-#[doc(hidden)]
-pub fn probe_arm_for_test(path: &Path, pages: &[u64]) {
-    armed_map()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(path.to_path_buf(), pages.iter().copied().collect());
 }

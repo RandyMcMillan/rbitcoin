@@ -520,6 +520,8 @@ impl TableFile {
         // Capacity first, then header via overlapped-safe pwrite (not std Write).
         set_file_len(&file, &path, initial)?;
         handle_pwrite_all(&file, &path, 0, &header)?;
+        #[cfg(feature = "write-probe")]
+        crate::write_probe::created_leading(&path);
         let read_file = file.try_clone().map_err(|e| StoreError::io(&path, e))?;
 
         Ok(Self {
@@ -757,6 +759,8 @@ impl TableFile {
 
         let file_len = file.metadata().map_err(|e| StoreError::io(&path, e))?.len();
         let mut logical = le_u64!(header, 8);
+        #[cfg(feature = "write-probe")]
+        crate::write_probe::opened_leading(&path, logical);
         if logical < FILE_HEADER_LEN as u64 {
             logical = FILE_HEADER_LEN as u64;
         }
@@ -1026,6 +1030,16 @@ impl TableFile {
         )
     }
 
+    /// Write probe: the leading header end this file holds now. A trailing
+    /// table has none.
+    #[cfg(feature = "write-probe")]
+    fn probe_header(&self) -> Option<u64> {
+        if self.trailing_header {
+            return None;
+        }
+        crate::write_probe::header_on(&self.read_file, &self.path)
+    }
+
     #[cfg(feature = "write-probe")]
     fn probe(
         &self,
@@ -1034,6 +1048,8 @@ impl TableFile {
         bytes: &[u8],
         kind: crate::write_probe::WriteKind,
     ) -> crate::write_probe::Landing {
+        // The header in the file, not the RAM length: a publish moves RAM first.
+        let committed = self.probe_header().unwrap_or(committed);
         crate::write_probe::write(
             &self.path,
             committed,
@@ -1580,7 +1596,7 @@ impl TableFile {
             ));
         }
         #[cfg(feature = "write-probe")]
-        let probe_n = crate::write_probe::sync_begin(&self.path);
+        let probe_n = crate::write_probe::sync_begin(&self.path, self.probe_header());
         self.read_file
             .durable_sync_data()
             .map_err(|e| StoreError::io(&self.path, e))?;
@@ -1631,7 +1647,7 @@ impl TableFile {
         #[cfg(feature = "write-probe")]
         let probe_n: Vec<_> = files
             .iter()
-            .map(|f| crate::write_probe::sync_begin(&f.path))
+            .map(|f| crate::write_probe::sync_begin(&f.path, f.probe_header()))
             .collect();
         let mut handles: Vec<_> = files.iter().map(|f| f.io_handle()).collect();
         handles.extend(
@@ -1709,7 +1725,7 @@ impl TableFile {
             ));
         }
         #[cfg(feature = "write-probe")]
-        let probe_n = crate::write_probe::sync_begin(&self.path);
+        let probe_n = crate::write_probe::sync_begin(&self.path, self.probe_header());
         self.file
             .lock()
             .unwrap()

@@ -42,5 +42,4 @@ crates/rbitcoin-store/src/uring_session.rs	opcode_Write	1
 crates/rbitcoin-store/src/var_table.rs	WriteOp	2
 crates/rbitcoin-store/src/var_table.rs	pwrite_batch	2
 crates/rbitcoin-store/src/var_table.rs	set_len	1
-crates/rbitcoin-store/src/write_probe.rs	FileExt	1
 crates/rbitcoin-store/src/write_probe.rs	write_all	1

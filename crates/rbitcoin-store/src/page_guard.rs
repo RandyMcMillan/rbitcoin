@@ -124,13 +124,23 @@ fn sync_mark_dir_then_release(parent: &Path, released: &[PathBuf]) -> Result<(),
             forget_armed(path);
         }
     } else {
-        let set = pending.entry(parent.to_path_buf()).or_default();
-        for path in released {
-            block_armed(path);
-            set.insert(path.clone());
-        }
+        hold_pending(&mut pending, parent, released);
     }
     synced
+}
+
+/// Block `released` and keep them pending on `parent` until a sync of it
+/// succeeds.
+fn hold_pending(
+    pending: &mut HashMap<PathBuf, HashSet<PathBuf>>,
+    parent: &Path,
+    released: &[PathBuf],
+) {
+    let set = pending.entry(parent.to_path_buf()).or_default();
+    for path in released {
+        block_armed(path);
+        set.insert(path.clone());
+    }
 }
 
 /// Reject a range that shares a committed page when `path` has a live arm
@@ -411,9 +421,9 @@ fn retain_unsynced(path: &Path, synced: &HashSet<String>) -> Result<(), StoreErr
     let raw = match std::fs::read(path) {
         Ok(raw) => raw,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let parent = mark_parent(path)?;
-            fsync_parent_dir(parent).map_err(|err| StoreError::io(parent, err))?;
-            return Ok(());
+            // A retry after a failed sync finds no mark; its sync releases
+            // the files that change left pending.
+            return sync_mark_dir_then_release(mark_parent(path)?, &[]);
         }
         Err(e) => return Err(StoreError::io(path, e)),
     };
@@ -576,17 +586,21 @@ pub fn clear_sh_marks(dir: &Path) -> Result<(), StoreError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(StoreError::io(&guard, e)),
     };
-    let mut released = Vec::new();
+    // Every entry is read before the first unlink, so a directory-entry
+    // error cannot follow an unlink.
+    let mut names = Vec::new();
     for ent in rd {
         let ent = ent.map_err(|e| StoreError::io(&guard, e))?;
-        let name = ent.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if !name.starts_with("sh-") {
-            continue;
+        if let Some(name) = ent.file_name().to_str() {
+            if name.starts_with("sh-") {
+                names.push(name.to_string());
+            }
         }
-        let path = ent.path();
+    }
+    names.sort_unstable();
+    let mut released = Vec::new();
+    for name in names {
+        let path = guard.join(&name);
         let mut named = HashSet::new();
         if !name.ends_with(".tmp") {
             if let Ok(raw) = std::fs::read(&path) {
@@ -600,7 +614,18 @@ pub fn clear_sh_marks(dir: &Path) -> Result<(), StoreError> {
         match std::fs::remove_file(&path) {
             Ok(()) => released.extend(live_paths(&path, &named)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(StoreError::io(&path, e)),
+            Err(e) => {
+                // The earlier unlinks are not durable, and a retry no longer
+                // finds those marks: their files stay pending on `guard/`.
+                hold_pending(
+                    &mut pending_release_map()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()),
+                    &guard,
+                    &released,
+                );
+                return Err(StoreError::io(&path, e));
+            }
         }
     }
     // Sync even when this call unlinked nothing: a retry after a failed

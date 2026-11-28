@@ -914,6 +914,53 @@ fn clear_sh_marks_retry_syncs_the_guard_dir() {
         .expect("the synced retry releases the file");
 }
 
+/// `clear_sh_marks` unlinks `sh-a`, then fails to unlink `sh-b`. The file
+/// `sh-a` named stays blocked, because that unlink is not durable yet, and
+/// the retry that finds `sh-a` gone still releases it once `guard/` syncs.
+#[cfg(all(unix, debug_assertions))]
+#[test]
+fn clear_sh_marks_keeps_an_earlier_unlink_pending_when_a_later_one_fails() {
+    let dir = TempDir::labeled("page-guard-sh-partial").unwrap();
+    let (file, path) = committed_body(&dir);
+    arm_page0(&dir, "guard/sh-a");
+    let guard = dir.path().join("guard");
+    // A directory where a mark should be: its unlink fails.
+    std::fs::create_dir(guard.join("sh-b")).unwrap();
+    assert!(clear_sh_marks(dir.path()).is_err());
+    assert!(!guard.join("sh-a").exists(), "sh-a went before sh-b");
+    let committed = rbitcoin_store::file::FILE_HEADER_LEN as u64 + 2 * PAGE as u64;
+    assert!(
+        rbitcoin_store::page_guard::check_armed_write(&path, committed, 256, 16).is_err(),
+        "page 0 took a write before the sh-a unlink was durable"
+    );
+    std::fs::remove_dir(guard.join("sh-b")).unwrap();
+    clear_sh_marks(dir.path()).unwrap();
+    file.write_at(PAGE as u64, &[0x77; 16])
+        .expect("the synced retry releases the file sh-a named");
+}
+
+/// `clear_page_guard_rel` unlinks the mark, then fails the `guard/` sync.
+/// The retry finds no mark; its sync must still release the blocked file.
+#[cfg(debug_assertions)]
+#[test]
+fn clear_rel_retry_with_no_mark_releases_the_blocked_file() {
+    let dir = TempDir::labeled("page-guard-rel-retry").unwrap();
+    let (file, path) = committed_body(&dir);
+    let mark = dir.path().join("guard/mark");
+    arm_page0(&dir, "guard/mark");
+    rbitcoin_store::page_guard::fail_next_mark_dir_sync(&dir.path().join("guard"));
+    let files = [(&file.read_file, path.as_path())];
+    assert!(clear_page_guard_rel(&mark, dir.path(), &files).is_err());
+    assert!(!mark.exists(), "the unlink landed");
+    assert!(
+        file.write_at(PAGE as u64 + 256, &[0x44; 16]).is_err(),
+        "the file took a write before the unlink was durable"
+    );
+    clear_page_guard_rel(&mark, dir.path(), &files).unwrap();
+    file.write_at(PAGE as u64, &[0x77; 16])
+        .expect("the synced retry releases the file");
+}
+
 /// A clear that unlinks the mark and then fails its directory sync blocks
 /// the file: the unlink is not durable, and a crash could bring the mark
 /// back over a later write. A retry that syncs releases it.

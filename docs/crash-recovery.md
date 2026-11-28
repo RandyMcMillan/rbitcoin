@@ -32,8 +32,11 @@ transaction.
 - Class A keeps the highest create a durable `header_txs` range or
   `class_a.synced` names, not the last bytes it finds. An append writes past
   the committed end, so the sectors it shares with committed rows land
-  unchanged, and the barrier is the stem sync. Open removes a leftover
-  `tear_guard/` or `{stem}.kept`, which no release wrote.
+  unchanged, and the barrier is the stem sync. No release wrote
+  `tear_guard/` or `{stem}.kept`, but a pre-0.10 master build did. Open
+  writes back the page images they hold the way that build's open did,
+  syncs the stems, then removes them. An image that holds bytes but does
+  not decode stops open with `Corrupt` and stays on disk.
 - Class C `confirmed[]` and `header_txs_*` write a synced `*.ahead` sidecar
   of the intended pages before an in-place write, and open restores it before
   reading the table. An array flush always images page 0, because it rewrites

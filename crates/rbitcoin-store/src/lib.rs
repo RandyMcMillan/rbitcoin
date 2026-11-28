@@ -21,7 +21,7 @@ pub mod block_wire;
 pub mod bulk_io;
 #[doc(hidden)]
 pub mod chain;
-#[doc(hidden)]
+mod class_a_legacy;
 #[doc(hidden)]
 pub mod compact;
 #[doc(hidden)]

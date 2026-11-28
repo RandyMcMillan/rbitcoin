@@ -65,25 +65,186 @@ fn a_class_a_barrier_writes_no_page_image() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A store from a build that imaged Class A pages can hold `tear_guard/`
-/// and a `.kept` sidecar. Nothing reads them now: open removes both and
-/// leaves the stems alone.
-#[test]
-fn open_drops_leftover_class_a_images() {
-    let dir = tmp();
-    {
-        let s = Store::create_tiny(&dir).unwrap();
-        s.put_tx_full_batch_indexed(&[coinbase([0x71u8; 32])], false)
-            .unwrap();
-        s.txs.sync_class_a_named(1).unwrap();
+/// Sync-array order of the build that imaged Class A pages.
+const LEGACY_STEMS: [&str; 16] = [
+    "txout.body",
+    "seqsigwit.body",
+    "spent.body",
+    "create.loc",
+    "create.loc.ovf",
+    "create.off",
+    "seqsigwit.loc",
+    "seqsigwit.loc.ovf",
+    "seqsigwit.off",
+    "txid.body",
+    "txstat.body",
+    "txstat.ovf",
+    "txstat.blk",
+    "input.loc",
+    "input.off",
+    "input.body",
+];
+const LEGACY_TAIL_BYTES: usize = 17 * PAGE;
+
+fn sha(parts: &[&[u8]]) -> [u8; 32] {
+    use bitcoin_hashes::{sha256, Hash, HashEngine};
+    let mut eng = sha256::HashEngine::default();
+    for part in parts {
+        eng.input(part);
     }
-    let before = std::fs::read(dir.join("txid.body")).unwrap();
-    std::fs::create_dir_all(dir.join("tear_guard")).unwrap();
-    std::fs::write(dir.join("tear_guard/tail.0"), vec![0x5au8; 4096]).unwrap();
-    std::fs::write(dir.join("tear_guard/armed"), b"CARM").unwrap();
-    std::fs::write(dir.join("txid.body.kept"), b"CATK").unwrap();
+    sha256::Hash::from_engine(eng).to_byte_array()
+}
+
+fn legacy_tail_span(published: u64, file_len: u64) -> (u64, usize) {
+    let page = PAGE as u64;
+    if published == 0 || published.is_multiple_of(page) || published > file_len {
+        return (0, 0);
+    }
+    let off = published & !(page - 1);
+    (off, (published - off) as usize)
+}
+
+fn legacy_seal_tail(buf: &mut [u8]) {
+    let sum = sha(&[&buf[..24], &buf[56..]]);
+    buf[24..56].copy_from_slice(&sum);
+}
+
+/// `tail.N` as the imaging build's barrier wrote it: each stem's published
+/// length and the partial last block below it, read from disk.
+fn legacy_tail_slot(dir: &Path, generation: u64) -> Vec<u8> {
+    let mut buf = vec![0u8; LEGACY_TAIL_BYTES];
+    buf[0..4].copy_from_slice(b"CAPT");
+    buf[4..6].copy_from_slice(&1u16.to_le_bytes());
+    buf[6..8].copy_from_slice(&16u16.to_le_bytes());
+    buf[8..16].copy_from_slice(&generation.to_le_bytes());
+    for (i, name) in LEGACY_STEMS.iter().enumerate() {
+        let path = dir.join(name);
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        let file_len = meta.len();
+        let published = if file_len >= 16 { logical_of(&path) } else { 0 };
+        let (off, n) = legacy_tail_span(published, file_len);
+        let head = 56 + i * 16;
+        buf[head..head + 8].copy_from_slice(&published.to_le_bytes());
+        buf[head + 8..head + 16].copy_from_slice(&off.to_le_bytes());
+        buf[312 + i * 2..314 + i * 2].copy_from_slice(&(n as u16).to_le_bytes());
+        if n > 0 {
+            let at = PAGE + i * PAGE;
+            read_at(&path, off, &mut buf[at..at + n]);
+            if off == 0 && n >= 16 {
+                buf[at + 8..at + 16].copy_from_slice(&published.to_le_bytes());
+            }
+        }
+    }
+    legacy_seal_tail(&mut buf);
+    buf
+}
+
+/// A `tail.N` the imaging build created and had not filled yet.
+fn legacy_vacant_tail() -> Vec<u8> {
+    let mut buf = vec![0u8; LEGACY_TAIL_BYTES];
+    buf[0..4].copy_from_slice(b"CAPT");
+    buf[4..6].copy_from_slice(&1u16.to_le_bytes());
+    buf[6..8].copy_from_slice(&16u16.to_le_bytes());
+    legacy_seal_tail(&mut buf);
+    buf
+}
+
+/// `first` with page 0 of every stem past one page sealed, as the imaging
+/// build's open left it.
+fn legacy_first(dir: &Path) -> Vec<u8> {
+    let mut first = vec![0u8; 16 * 2 * PAGE];
+    for (i, name) in LEGACY_STEMS.iter().enumerate() {
+        let path = dir.join(name);
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if meta.len() < 16 || logical_of(&path) < PAGE as u64 {
+            continue;
+        }
+        let at = i * 2 * PAGE;
+        let n = (meta.len() as usize).min(PAGE);
+        read_at(&path, 0, &mut first[at..at + n]);
+        let image_sum = sha(&[&first[at..at + PAGE]]);
+        let commit = &mut first[at + PAGE..at + 2 * PAGE];
+        commit[0..4].copy_from_slice(b"CAPF");
+        commit[4..6].copy_from_slice(&(i as u16).to_le_bytes());
+        commit[6..8].copy_from_slice(&(PAGE as u16).to_le_bytes());
+        commit[8..40].copy_from_slice(&image_sum);
+        let sum = sha(&[&commit[..40]]);
+        commit[40..72].copy_from_slice(&sum);
+    }
+    first
+}
+
+fn write_legacy_guard(dir: &Path) {
+    let guard = dir.join("tear_guard");
+    std::fs::create_dir_all(&guard).unwrap();
+    std::fs::write(guard.join("first"), legacy_first(dir)).unwrap();
+    std::fs::write(guard.join("tail.0"), legacy_tail_slot(dir, 1)).unwrap();
+    std::fs::write(guard.join("tail.1"), legacy_vacant_tail()).unwrap();
+}
+
+fn zero_at(path: &Path, offset: u64, len: usize) {
+    let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.seek(SeekFrom::Start(offset)).unwrap();
+    file.write_all(&vec![0u8; len]).unwrap();
+    file.sync_all().unwrap();
+}
+
+fn store_130(dir: &Path) {
+    let s = Store::create_tiny(dir).unwrap();
+    let batch: Vec<_> = (1..=130u64).map(|i| coinbase([i as u8; 32])).collect();
+    s.put_tx_full_batch_indexed(&batch, false).unwrap();
+    s.txs.sync_class_a_named(130).unwrap();
+}
+
+fn is_corrupt(r: Result<Store, rbitcoin_store::StoreError>) -> bool {
+    matches!(r, Err(rbitcoin_store::StoreError::Corrupt(_)))
+}
+
+/// A crash under the build that imaged Class A pages can leave a committed
+/// page zeroed, with its only synced copy in `tear_guard/`. Open writes
+/// page 0 back from `first` and the partial last block from the newer tail
+/// slot, then removes the guard.
+#[test]
+fn open_restores_a_torn_page_from_a_legacy_tear_guard() {
+    let dir = tmp();
+    store_130(&dir);
+    let txid = dir.join("txid.body");
+    let before = std::fs::read(&txid).unwrap();
+    let published = logical_of(&txid);
+    let (off, n) = legacy_tail_span(published, before.len() as u64);
+    assert!(off >= PAGE as u64 && n > 0, "txid.body has no partial tail");
+    write_legacy_guard(&dir);
+    zero_at(&txid, 0, PAGE);
+    zero_at(&txid, off, n);
     let s = Store::open_tiny(&dir).unwrap();
-    assert_eq!(s.txs.txids.get(Fk(1)).unwrap(), [0x71u8; 32]);
+    assert_eq!(s.txs.txids.get(Fk(1)).unwrap(), [1u8; 32]);
+    assert_eq!(s.txs.txids.get(Fk(130)).unwrap(), [130u8; 32]);
+    drop(s);
+    assert!(!dir.join("tear_guard").exists(), "open left tear_guard/");
+    assert_eq!(std::fs::read(&txid).unwrap(), before);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A guard the imaging build left after a clean stop, and a `.kept` over a
+/// range that is not zeroes, change no stem. Open removes them.
+#[test]
+fn open_drops_a_clean_legacy_tear_guard() {
+    let dir = tmp();
+    store_130(&dir);
+    let before = std::fs::read(dir.join("txid.body")).unwrap();
+    write_legacy_guard(&dir);
+    let mut kept = Vec::new();
+    kept.extend_from_slice(b"CATK");
+    kept.extend_from_slice(&0u64.to_le_bytes());
+    kept.extend_from_slice(&(PAGE as u32).to_le_bytes());
+    kept.extend_from_slice(&[0x5au8; PAGE]);
+    std::fs::write(dir.join("txid.body.kept"), kept).unwrap();
+    let s = Store::open_tiny(&dir).unwrap();
+    assert_eq!(s.txs.txids.get(Fk(130)).unwrap(), [130u8; 32]);
     drop(s);
     assert!(!dir.join("tear_guard").exists(), "open left tear_guard/");
     assert!(
@@ -91,6 +252,40 @@ fn open_drops_leftover_class_a_images() {
         "open left the .kept sidecar"
     );
     assert_eq!(std::fs::read(dir.join("txid.body")).unwrap(), before);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Two tail slots that both fail to decode, a `.kept` that is not a `CATK`
+/// image, or a sealed page 0 whose commit fails its checksum may hold the
+/// only copy of a page. Open refuses and leaves them on disk.
+#[test]
+fn open_refuses_an_unparsable_legacy_image() {
+    let dir = tmp();
+    store_130(&dir);
+    let guard = dir.join("tear_guard");
+    std::fs::create_dir_all(&guard).unwrap();
+    std::fs::write(guard.join("tail.0"), vec![0x5au8; LEGACY_TAIL_BYTES]).unwrap();
+    std::fs::write(guard.join("tail.1"), vec![0x5au8; LEGACY_TAIL_BYTES]).unwrap();
+    assert!(
+        is_corrupt(Store::open_tiny(&dir)),
+        "open took two bad slots"
+    );
+    assert!(guard.join("tail.0").exists(), "open removed a bad slot");
+    std::fs::remove_dir_all(&guard).unwrap();
+    std::fs::write(dir.join("txid.body.kept"), b"CATK").unwrap();
+    assert!(is_corrupt(Store::open_tiny(&dir)), "open took a bad .kept");
+    assert!(
+        dir.join("txid.body.kept").exists(),
+        "open removed a bad .kept"
+    );
+    std::fs::remove_file(dir.join("txid.body.kept")).unwrap();
+    write_legacy_guard(&dir);
+    let first = guard.join("first");
+    let mut raw = std::fs::read(&first).unwrap();
+    raw[9 * 2 * PAGE + PAGE + 8] ^= 1;
+    std::fs::write(&first, raw).unwrap();
+    assert!(is_corrupt(Store::open_tiny(&dir)), "open took a bad seal");
+    assert!(first.exists(), "open removed a bad seal");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

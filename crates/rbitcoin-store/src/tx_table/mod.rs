@@ -1334,37 +1334,6 @@ fn enter_class_a_writer_depth(table: *const ()) -> ClassAWriterDepth {
     })
 }
 
-/// `tear_guard/` and `{stem}.kept` came from a build that imaged Class A
-/// pages. The sector rule leaves nothing for them to restore, and nothing
-/// reads them, so open removes them.
-fn drop_class_a_images(hot: &Path, seq: &Path) -> Result<(), StoreError> {
-    let guard = hot.join("tear_guard");
-    match std::fs::remove_dir_all(&guard) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(StoreError::io(&guard, e)),
-    }
-    for dir in [hot, seq] {
-        let entries = match std::fs::read_dir(dir) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(StoreError::io(dir, e)),
-        };
-        for ent in entries {
-            let ent = ent.map_err(|e| StoreError::io(dir, e))?;
-            if ent.file_name().to_string_lossy().ends_with(".kept") {
-                let path = ent.path();
-                match std::fs::remove_file(&path) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(StoreError::io(&path, e)),
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 fn publish_prepared_body(
     table: &VarTable,
     prep: crate::var_table::PreparedAppend,
@@ -1675,7 +1644,7 @@ impl TxTable {
         opts: HeadOpenOpts,
         store: Option<OpenedFromStore>,
     ) -> Result<Self, StoreError> {
-        drop_class_a_images(dir, seqsigwit_dir)?;
+        crate::class_a_legacy::replay_and_drop(dir, seqsigwit_dir)?;
         crate::store::rename_legacy_inwit_files(dir)?;
         crate::store::rename_legacy_input_files(dir)?;
         crate::store::rename_legacy_inwit_files(seqsigwit_dir)?;

@@ -209,6 +209,12 @@ impl Appended {
         let at = usize::try_from(fk.get()?.checked_sub(self.first)?).ok()?;
         self.loc.get(at).map(|pair| pair.spent)
     }
+
+    /// This batch's Class A append created `fk`. A reconnect keeps the old fk
+    /// and is not in this set.
+    pub(crate) fn contains(&self, fk: rbitcoin_primitives::Fk) -> bool {
+        self.spent(fk).is_some()
+    }
 }
 
 #[doc(hidden)]
@@ -414,6 +420,7 @@ fn write_phase_inner(
                 &batch.wire_blocks,
                 &batch.batch_parents,
                 &abs_jobs,
+                &appended,
                 &mut reuse.borrow_mut(),
             )
         })?;

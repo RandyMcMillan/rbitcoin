@@ -1719,3 +1719,101 @@ fn a_same_batch_spend_of_an_earlier_block_skips_the_slot_read() {
     );
     let _ = dir;
 }
+
+/// A parent this batch is connecting again already has a spend slot. Freeze
+/// keeps a multi-list there. Structural must read it, or the reconnect
+/// writes a sole spender over that list.
+#[test]
+fn a_reconnected_cross_block_spend_keeps_its_multi_list() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("spend-reconnect-multi");
+    q.set_spend_index(true);
+    let params = ChainParams::regtest();
+    let ms = Milestone::NONE;
+    let maturity = params.coinbase_maturity();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let b1 = mine(
+        genesis.block_hash(),
+        genesis.header.time + 600,
+        1,
+        Vec::new(),
+    );
+    let c1 = b1.txdata[0].compute_txid();
+    accept_and_connect_block(&q, &params, Height(1), &b1, ms).unwrap();
+    let mut tip = b1.block_hash();
+    let mut tip_time = b1.header.time;
+    connect_until(&q, &params, ms, &mut tip, &mut tip_time, maturity + 2);
+
+    let h_parent = maturity + 3;
+    let parent = spend_one(c1, Amount::from_sat(49_0000_0000));
+    let pid = parent.compute_txid();
+    let parent_block = mine(tip, tip_time + 600, h_parent, vec![parent]);
+    accept_and_connect_block(&q, &params, Height(h_parent), &parent_block, ms).unwrap();
+    let h_child = h_parent + 1;
+    let child = spend_one(pid, Amount::from_sat(48_0000_0000));
+    let cid = child.compute_txid();
+    let child_block = mine(
+        parent_block.block_hash(),
+        parent_block.header.time + 600,
+        h_child,
+        vec![child],
+    );
+    accept_and_connect_block(&q, &params, Height(h_child), &child_block, ms).unwrap();
+
+    let parent_fk = q.tx_fk_by_txid(pid.as_byte_array()).unwrap().unwrap();
+    let child_fk = q.tx_fk_by_txid(cid.as_byte_array()).unwrap().unwrap();
+    q.disconnect_tip().unwrap();
+    q.disconnect_tip().unwrap();
+
+    let (off, _) = q.store().tx_spent_range(parent_fk).unwrap();
+    let abs = spent_abs(off, 0);
+    let leftover = rbitcoin_primitives::Fk(50_000);
+    let older = q
+        .store()
+        .spenders
+        .append(leftover, 0, rbitcoin_primitives::Fk::NULL)
+        .unwrap();
+    let head = q.store().spenders.append(child_fk, 0, older).unwrap();
+    let slot = rbitcoin_store::tx_table::encode_spent_slot(
+        rbitcoin_store::output_flags::MULTI_SPENDER,
+        head,
+        0,
+    )
+    .unwrap();
+    q.store().note_open_spend_slots(&[(abs, slot)]).unwrap();
+
+    let _ = q.confirm_stats().take_window();
+    rbitcoin_query::confirm_wire_run(
+        &q,
+        &params,
+        ms,
+        &[
+            (Height(h_parent), parent_block),
+            (Height(h_child), child_block),
+        ],
+    )
+    .unwrap();
+    let (multi, field, _) = q.store().txs.get_output_spender_meta(parent_fk, 0).unwrap();
+    assert!(multi, "reconnect wrote a sole spender over the multi-list");
+    let mut cur = field;
+    let mut members = Vec::new();
+    while cur.get().is_some() {
+        let (sfk, vin, next) = q.store().spenders.get(cur).unwrap();
+        members.push((sfk, vin));
+        cur = next;
+    }
+    assert!(
+        members.contains(&(child_fk, 0)),
+        "multi-list lost the reconnected spender: {members:?}"
+    );
+    assert!(
+        members.contains(&(leftover, 0)),
+        "multi-list lost the spender that was not in this reconnect: {members:?}"
+    );
+    assert_eq!(
+        q.confirm_stats().take_window().spend_meta_n,
+        2,
+        "the coinbase spend and the reconnected parent slot are both read"
+    );
+    let _ = dir;
+}

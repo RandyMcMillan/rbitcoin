@@ -3425,6 +3425,7 @@ fn structural_run_clears_reused_scratch_between_batches() {
             &wire,
             &bp,
             &jobs,
+            &rbitcoin_query::confirm_run::write::Appended::default(),
             reuse,
         )
         .expect("reused scratch still connects")
@@ -3589,6 +3590,7 @@ fn structural_run_reads_spend_meta_once_per_write() {
         &wire,
         &bp,
         &jobs,
+        &rbitcoin_query::confirm_run::write::Appended::default(),
         &mut reuse,
     )
     .expect("two first spends of an unspent page");
@@ -3614,6 +3616,7 @@ fn structural_run_reads_spend_meta_once_per_write() {
         &again_wire,
         &bp,
         &again_jobs,
+        &rbitcoin_query::confirm_run::write::Appended::default(),
         &mut StructuralReuse::default(),
     )
     .expect_err("the second block spends an outpoint the first block took");

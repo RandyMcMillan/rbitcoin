@@ -347,6 +347,7 @@ pub fn structural_run(
     wire_blocks: &[Arc<Block>],
     batch_parents: &crate::BatchParents,
     abs_jobs: &[Vec<crate::block_pipeline::StructuralAbsJob>],
+    appended: &super::write::Appended,
     reuse: &mut StructuralReuse,
 ) -> Result<crate::block_pipeline::AnnotateSlots, ConfirmError> {
     use crate::block_pipeline::StructuralPhaseNs;
@@ -370,11 +371,12 @@ pub fn structural_run(
     }
     let mut tot = StructuralPhaseNs::default();
     let bip34_ancestor = bip34_ancestor_for_write(query, params, prepared);
-    // Each block reads its slice of this one prefetch. A parent created in
-    // this batch is not annotated yet, so its slot is empty and is not read.
+    // Each block reads its slice of this one prefetch. A parent this batch
+    // appended has an empty slot, so that slot is not read. A parent this
+    // batch is only connecting again still has its slot.
     let mut read_at = Vec::new();
     for &(id, _, abs, _, _) in abs_jobs.iter().flatten() {
-        if index.create(rbitcoin_primitives::Fk(id)).is_none() {
+        if !appended.contains(rbitcoin_primitives::Fk(id)) {
             read_at.push(reuse.scratch.meta_offs.len());
         }
         reuse.scratch.meta_offs.push(abs);

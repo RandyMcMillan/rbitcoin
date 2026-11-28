@@ -1,5 +1,6 @@
 Changed
 
-- Structural spentness does not read a spend slot whose parent was created
-  in the same confirm batch. That slot is still empty. A parent from an
-  earlier batch is still read.
+- Structural spentness does not read a spend slot whose parent this
+  confirm batch appended. That slot is still empty. A parent from an
+  earlier batch, including one this batch is connecting again, is still
+  read.

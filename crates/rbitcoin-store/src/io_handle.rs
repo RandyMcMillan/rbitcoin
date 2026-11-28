@@ -92,6 +92,10 @@ impl IoHandle {
         if let Some(r) = injected_sync(self) {
             return r;
         }
+        #[cfg(debug_assertions)]
+        if take_fail_sync_on_thread() {
+            return -5;
+        }
         #[cfg(unix)]
         // SAFETY: the caller keeps the fd open; `ManuallyDrop` never closes it.
         let file = std::mem::ManuallyDrop::new(unsafe {
@@ -125,7 +129,7 @@ impl IoHandle {
             return -disk_full_errno();
         }
         #[cfg(debug_assertions)]
-        if buf.len() > 8 && short_pwrite_armed(self) {
+        if buf.len() > 8 && (short_pwrite_armed(self) || take_short_pwrite_len(buf.len())) {
             let n = self.pwrite_sys(offset, &buf[..8]);
             if n < 0 {
                 return n;
@@ -398,6 +402,61 @@ fn take_fail_pread_len(len: usize) -> bool {
             return false;
         }
         slot.set((want, n - 1));
+        true
+    })
+}
+
+/// Make the next `n` pwrites of `len` bytes on this thread write 8 bytes and
+/// return disk-full.
+///
+/// Open restores a legacy page image through an fd the test never holds.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn arm_short_pwrite_len(len: usize, n: u32) {
+    SHORT_PWRITE_LEN.with(|slot| slot.set((len, n)));
+}
+
+/// Fail the next `n` [`IoHandle::durable_sync_data`] calls on this thread.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn arm_fail_sync_on_thread(n: u32) {
+    FAIL_SYNC_ON_THREAD.with(|slot| slot.set(n));
+}
+
+/// Clear [`arm_short_pwrite_len`] and [`arm_fail_sync_on_thread`] on this thread.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn disarm_thread_writes() {
+    SHORT_PWRITE_LEN.with(|slot| slot.set((0, 0)));
+    FAIL_SYNC_ON_THREAD.with(|slot| slot.set(0));
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static SHORT_PWRITE_LEN: std::cell::Cell<(usize, u32)> = const { std::cell::Cell::new((0, 0)) };
+    static FAIL_SYNC_ON_THREAD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(debug_assertions)]
+fn take_short_pwrite_len(len: usize) -> bool {
+    SHORT_PWRITE_LEN.with(|slot| {
+        let (want, n) = slot.get();
+        if n == 0 || want != len {
+            return false;
+        }
+        slot.set((want, n - 1));
+        true
+    })
+}
+
+#[cfg(debug_assertions)]
+fn take_fail_sync_on_thread() -> bool {
+    FAIL_SYNC_ON_THREAD.with(|slot| {
+        let n = slot.get();
+        if n == 0 {
+            return false;
+        }
+        slot.set(n - 1);
         true
     })
 }

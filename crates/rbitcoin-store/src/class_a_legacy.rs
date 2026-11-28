@@ -4,9 +4,13 @@
 //! 4 KiB), `tear_guard/tail.0` and `tail.1` (alternating copies of each
 //! stem's partial last block and published length), and, before that, a
 //! `CATK` `{stem}.kept`. A crash under it can leave a committed page zeroed
-//! with its only synced copy here. Open writes those copies back the way
-//! that build's open did, syncs the stems, then removes the files. An image
-//! that holds bytes but does not decode stops open and stays on disk.
+//! with its only synced copy here. Open picks the copies to write back the
+//! way that build's open did, before it writes any stem, and keeps that
+//! choice in a synced [`PLAN_NAME`]. It then writes and syncs the stems,
+//! removes the plan, and removes the images. An open after a failed write
+//! or sync repeats the plan, so a partly written range never reads as
+//! intact. An image or plan that holds bytes but does not decode stops open
+//! and stays on disk.
 
 use crate::durability::Durable;
 use crate::error::StoreError;
@@ -14,6 +18,7 @@ use crate::file::{self, FILE_HEADER_LEN};
 use crate::io_handle::IoHandle;
 use bitcoin_hashes::{sha256, Hash, HashEngine};
 use std::fs::File;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const PAGE: usize = 4096;
@@ -32,8 +37,14 @@ const TAIL_LENS: usize = 312;
 const CHECKSUM_AT: usize = 24;
 const CHECKSUM_END: usize = 56;
 
+const CAPR: &[u8; 4] = b"CAPR";
+/// The writes a leftover image selected, kept until every one is synced.
+const PLAN_NAME: &str = "tear_guard.plan";
+const PLAN_TMP: &str = "tear_guard.plan.tmp";
+
 const CORRUPT_PAGE: &str = "class A page image does not decode over a zeroed block";
 const CORRUPT_IMAGE: &str = "leftover class A page image does not decode";
+const CORRUPT_PLAN: &str = "class A restore plan does not decode";
 
 /// Sync-array order of the imaging build. Slot and seal indexes use it.
 const STEMS: [&str; STEM_N] = [
@@ -57,24 +68,32 @@ const STEMS: [&str; STEM_N] = [
 
 /// Put back what a leftover tear guard or `.kept` holds, then remove them.
 ///
-/// Absent files are a no-op. Every restored stem is synced before its
-/// image is unlinked, so a crash in between replays the same bytes again.
+/// Absent files are a no-op. A plan an earlier open left is repeated as is.
+/// The plan goes only after every stem it names is synced, and the images
+/// only after the plan, so a crash in between replays the same bytes or
+/// selects nothing from the restored stems.
 pub(crate) fn replay_and_drop(hot: &Path, seq: &Path) -> Result<(), StoreError> {
+    let plan_path = hot.join(PLAN_NAME);
+    let plan = match load_plan(&plan_path)? {
+        Some(plan) => plan,
+        None => {
+            let plan = select(hot, seq)?;
+            if !plan.is_empty() {
+                persist_plan(hot, &plan)?;
+            }
+            plan
+        }
+    };
+    apply(hot, seq, &plan)?;
+    remove_file_synced(&plan_path)?;
+    remove_file_synced(&hot.join(PLAN_TMP))?;
     for name in STEMS {
-        replay_kept(&stem_path(hot, seq, name))?;
+        remove_file_synced(&kept_side(&stem_path(hot, seq, name)))?;
     }
     let guard = hot.join("tear_guard");
     if guard.try_exists().map_err(|e| StoreError::io(&guard, e))? {
-        let first = load_first(&guard.join("first"))?;
-        let best = load_best_tail(&guard)?;
-        for (i, name) in STEMS.iter().enumerate() {
-            restore_stem(&stem_path(hot, seq, name), name, i, &first, best.as_deref())?;
-        }
         std::fs::remove_dir_all(&guard).map_err(|e| StoreError::io(&guard, e))?;
         file::fsync_parent_dir(hot).map_err(|e| StoreError::io(hot, e))?;
-    }
-    for dir in [hot, seq] {
-        drop_other_kept(dir)?;
     }
     Ok(())
 }
@@ -87,20 +106,171 @@ fn stem_path(hot: &Path, seq: &Path, name: &str) -> PathBuf {
     }
 }
 
-/// `.kept` files outside the stem list carry nothing a stem reads.
-fn drop_other_kept(dir: &Path) -> Result<(), StoreError> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(StoreError::io(dir, e)),
+/// One selected write: `bytes` at `off` in stem `stem`.
+struct PlannedWrite {
+    stem: usize,
+    off: u64,
+    bytes: Vec<u8>,
+}
+
+/// Every write the leftover images call for, chosen from the stems as they
+/// are now. Refusals happen here, before any stem is written.
+fn select(hot: &Path, seq: &Path) -> Result<Vec<PlannedWrite>, StoreError> {
+    let guard = hot.join("tear_guard");
+    let images = if guard.try_exists().map_err(|e| StoreError::io(&guard, e))? {
+        Some((load_first(&guard.join("first"))?, load_best_tail(&guard)?))
+    } else {
+        None
     };
-    for ent in entries {
-        let ent = ent.map_err(|e| StoreError::io(dir, e))?;
-        if ent.file_name().to_string_lossy().ends_with(".kept") {
-            remove_file_synced(&ent.path())?;
+    let mut plan = Vec::new();
+    for (i, name) in STEMS.iter().enumerate() {
+        let path = stem_path(hot, seq, name);
+        let kept = load_kept(&path)?;
+        if (kept.is_none() && images.is_none())
+            || !path.try_exists().map_err(|e| StoreError::io(&path, e))?
+        {
+            continue;
         }
+        let mut stem = StemView::open(path)?;
+        if let Some((block, image)) = kept {
+            select_kept(&mut stem, block, &image)?;
+        }
+        if let Some((first, best)) = &images {
+            select_guard(&mut stem, name, i, first, best.as_deref())?;
+        }
+        plan.extend(stem.planned.into_iter().map(|(off, bytes)| PlannedWrite {
+            stem: i,
+            off,
+            bytes,
+        }));
+    }
+    Ok(plan)
+}
+
+/// Write every planned range, then sync each stem it touched.
+fn apply(hot: &Path, seq: &Path, plan: &[PlannedWrite]) -> Result<(), StoreError> {
+    for (i, name) in STEMS.iter().enumerate() {
+        let mut writes = plan.iter().filter(|w| w.stem == i).peekable();
+        if writes.peek().is_none() {
+            continue;
+        }
+        let path = stem_path(hot, seq, name);
+        let file = open_rw(&path)?;
+        for w in writes {
+            pwrite_exact(&file, &path, w.off, &w.bytes)?;
+        }
+        sync_data(&file, &path)?;
     }
     Ok(())
+}
+
+/// A stem as it reads with the writes selected so far laid over it, so a
+/// later choice sees what an earlier one will write.
+struct StemView {
+    file: File,
+    path: PathBuf,
+    len: u64,
+    planned: Vec<(u64, Vec<u8>)>,
+}
+
+impl StemView {
+    fn open(path: PathBuf) -> Result<Self, StoreError> {
+        let file = open_rw(&path)?;
+        let len = file.metadata().map_err(|e| StoreError::io(&path, e))?.len();
+        Ok(Self {
+            file,
+            path,
+            len,
+            planned: Vec::new(),
+        })
+    }
+
+    fn read(&self, offset: u64, buf: &mut [u8]) -> Result<(), StoreError> {
+        pread_exact(&self.file, &self.path, offset, buf)?;
+        let end = offset + buf.len() as u64;
+        for (at, bytes) in &self.planned {
+            let lo = offset.max(*at);
+            let hi = end.min(at + bytes.len() as u64);
+            if lo < hi {
+                buf[(lo - offset) as usize..(hi - offset) as usize]
+                    .copy_from_slice(&bytes[(lo - at) as usize..(hi - at) as usize]);
+            }
+        }
+        Ok(())
+    }
+
+    fn write(&mut self, offset: u64, bytes: &[u8]) {
+        if !bytes.is_empty() {
+            self.planned.push((offset, bytes.to_vec()));
+        }
+    }
+}
+
+// ---- tear_guard.plan ----
+
+/// `CAPR`, a count, each write as stem, offset, length and bytes, then a
+/// sha256 of everything before it.
+fn encode_plan(plan: &[PlannedWrite]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(CAPR);
+    buf.extend_from_slice(&(plan.len() as u32).to_le_bytes());
+    for w in plan {
+        buf.extend_from_slice(&(w.stem as u16).to_le_bytes());
+        buf.extend_from_slice(&w.off.to_le_bytes());
+        buf.extend_from_slice(&(w.bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&w.bytes);
+    }
+    let sum = sha256_parts(&[&buf]);
+    buf.extend_from_slice(&sum);
+    buf
+}
+
+fn decode_plan(raw: &[u8]) -> Option<Vec<PlannedWrite>> {
+    let body_len = raw.len().checked_sub(32)?;
+    let (body, sum) = raw.split_at(body_len);
+    if body.len() < 8 || body[0..4] != *CAPR || sha256_parts(&[body]) != sum {
+        return None;
+    }
+    let count = u32::from_le_bytes(body[4..8].try_into().ok()?) as usize;
+    let mut at = 8;
+    let mut plan = Vec::new();
+    for _ in 0..count {
+        let head = body.get(at..at + 14)?;
+        let stem = le_u16(&head[0..2]) as usize;
+        let off = le_u64(&head[2..10]);
+        let n = u32::from_le_bytes(head[10..14].try_into().ok()?) as usize;
+        if stem >= STEM_N || n == 0 || n > PAGE {
+            return None;
+        }
+        let bytes = body.get(at + 14..at + 14 + n)?.to_vec();
+        at += 14 + n;
+        plan.push(PlannedWrite { stem, off, bytes });
+    }
+    (at == body.len()).then_some(plan)
+}
+
+/// The plan an earlier open left, or `None` when there is none.
+fn load_plan(path: &Path) -> Result<Option<Vec<PlannedWrite>>, StoreError> {
+    let raw = read_or_empty(path)?;
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    decode_plan(&raw)
+        .map(Some)
+        .ok_or(StoreError::Corrupt(CORRUPT_PLAN))
+}
+
+/// A synced temp file renamed over the plan, so a plan is whole or absent.
+fn persist_plan(hot: &Path, plan: &[PlannedWrite]) -> Result<(), StoreError> {
+    let tmp = hot.join(PLAN_TMP);
+    let dst = hot.join(PLAN_NAME);
+    let mut file = File::create(&tmp).map_err(|e| StoreError::io(&tmp, e))?;
+    file.write_all(&encode_plan(plan))
+        .and_then(|()| file.durable_sync_data())
+        .map_err(|e| StoreError::io(&tmp, e))?;
+    drop(file);
+    std::fs::rename(&tmp, &dst).map_err(|e| StoreError::io(&dst, e))?;
+    file::fsync_parent_dir(hot).map_err(|e| StoreError::io(hot, e))
 }
 
 fn remove_file_synced(path: &Path) -> Result<(), StoreError> {
@@ -194,8 +364,11 @@ fn pwrite_exact(file: &File, path: &Path, offset: u64, buf: &[u8]) -> Result<(),
 }
 
 fn sync_data(file: &File, path: &Path) -> Result<(), StoreError> {
-    file.durable_sync_data()
-        .map_err(|e| StoreError::io(path, e))
+    let rc = IoHandle::from_file(file).durable_sync_data();
+    if rc < 0 {
+        return Err(StoreError::io(path, std::io::Error::from_raw_os_error(-rc)));
+    }
+    Ok(())
 }
 
 // ---- {stem}.kept ----
@@ -224,28 +397,30 @@ fn parse_catk(raw: &[u8]) -> Option<(u64, &[u8])> {
     Some((block, &raw[CATK_HEAD..]))
 }
 
-/// Apply a `CATK` image when its range is zeroes, then unlink it.
-fn replay_kept(path: &Path) -> Result<(), StoreError> {
+/// The `CATK` image beside `path`, if one holds bytes.
+fn load_kept(path: &Path) -> Result<Option<(u64, Vec<u8>)>, StoreError> {
     let side = kept_side(path);
     let raw = read_or_empty(&side)?;
-    if !vacant(&raw) {
-        let Some((block, image)) = parse_catk(&raw) else {
-            return Err(StoreError::Corrupt(CORRUPT_IMAGE));
-        };
-        if path.try_exists().map_err(|e| StoreError::io(path, e))? {
-            let file = open_rw(path)?;
-            let file_len = file.metadata().map_err(|e| StoreError::io(path, e))?.len();
-            if block.saturating_add(image.len() as u64) <= file_len {
-                let mut current = vec![0u8; image.len()];
-                pread_exact(&file, path, block, &mut current)?;
-                if all_zero(&current) {
-                    pwrite_exact(&file, path, block, image)?;
-                    sync_data(&file, path)?;
-                }
-            }
-        }
+    if vacant(&raw) {
+        return Ok(None);
     }
-    remove_file_synced(&side)
+    let Some((block, image)) = parse_catk(&raw) else {
+        return Err(StoreError::Corrupt(CORRUPT_IMAGE));
+    };
+    Ok(Some((block, image.to_vec())))
+}
+
+/// Select a `CATK` image when its range is zeroes.
+fn select_kept(stem: &mut StemView, block: u64, image: &[u8]) -> Result<(), StoreError> {
+    if block.saturating_add(image.len() as u64) > stem.len {
+        return Ok(());
+    }
+    let mut current = vec![0u8; image.len()];
+    stem.read(block, &mut current)?;
+    if all_zero(&current) {
+        stem.write(block, image);
+    }
+    Ok(())
 }
 
 // ---- tear_guard/first ----
@@ -379,55 +554,49 @@ fn tail_span(published: u64, file_len: u64) -> (u64, u16) {
     (off, n as u16)
 }
 
-fn header_published(file: &File, path: &Path, file_len: u64) -> Result<u64, StoreError> {
-    if file_len < FILE_HEADER_LEN as u64 {
+fn header_published(stem: &StemView) -> Result<u64, StoreError> {
+    if stem.len < FILE_HEADER_LEN as u64 {
         return Ok(0);
     }
     let mut header = [0u8; FILE_HEADER_LEN];
-    pread_exact(file, path, 0, &mut header)?;
+    stem.read(0, &mut header)?;
     Ok(le_u64(&header[8..16]))
 }
 
-fn restore_stem(
-    path: &Path,
+/// Select page 0 and the partial last block from the guard, then refuse a
+/// zeroed prefix those writes leave.
+fn select_guard(
+    view: &mut StemView,
     name: &str,
     stem: usize,
     first: &[u8],
     best: Option<&TailSlot>,
 ) -> Result<(), StoreError> {
-    if !path.try_exists().map_err(|e| StoreError::io(path, e))? {
-        return Ok(());
-    }
-    let file = open_rw(path)?;
-    let file_len = file.metadata().map_err(|e| StoreError::io(path, e))?.len();
+    let file_len = view.len;
     if file_len == 0 {
         return Ok(());
     }
-    let header_len = header_published(&file, path, file_len)?;
+    let header_len = header_published(view)?;
     let mut published = best
         .map(|slot| slot.published[stem])
         .filter(|n| *n > 0)
         .unwrap_or(header_len);
     let mut page0 = vec![0u8; (file_len as usize).min(PAGE)];
-    pread_exact(&file, path, 0, &mut page0)?;
+    view.read(0, &mut page0)?;
     let page0_zero = all_zero(&page0);
     let sealed = sealed_page0(first, stem)?;
-    let page0_restored = restore_page0(&file, path, stem, published, sealed, best, &page0)?;
+    let page0_restored = restore_page0(view, stem, published, sealed, best, &page0);
     if page0_restored {
-        // A zeroed header read as 0. The length just written is the one
-        // the tail check has to use.
-        let restored_len = header_published(&file, path, file_len)?;
+        // A zeroed header read as 0. The length selected for it is the
+        // one the tail check has to use.
+        let restored_len = header_published(view)?;
         if restored_len > published {
             published = restored_len;
         }
     }
-    let tail_restored = restore_tail_block(&file, path, stem, published, file_len, best)?;
-    if page0_restored || tail_restored {
-        sync_data(&file, path)?;
-    }
+    let tail_restored = restore_tail_block(view, stem, published, best)?;
     refuse_zero_prefix(
-        &file,
-        path,
+        view,
         name,
         published,
         file_len,
@@ -446,27 +615,26 @@ struct ZeroRefuse {
 }
 
 fn restore_page0(
-    file: &File,
-    path: &Path,
+    view: &mut StemView,
     stem: usize,
     published: u64,
     sealed: Option<Vec<u8>>,
     best: Option<&TailSlot>,
     page0: &[u8],
-) -> Result<bool, StoreError> {
+) -> bool {
     if all_zero(page0) {
         if let Some(mut image) = sealed {
             let len = recorded_len(best, stem, published, le_u64(&image[8..16]));
             image[8..16].copy_from_slice(&len.to_le_bytes());
-            pwrite_exact(file, path, 0, &image)?;
-            return Ok(true);
+            view.write(0, &image);
+            return true;
         }
     }
     let Some(slot) = best else {
-        return Ok(false);
+        return false;
     };
     if slot.tail_off[stem] != 0 || slot.tail_len[stem] == 0 {
-        return Ok(false);
+        return false;
     }
     let raw = image_of(slot, stem);
     let mut image = raw.to_vec();
@@ -474,13 +642,13 @@ fn restore_page0(
     // One write. A page that is still the unstamped image is that write
     // without the slot length.
     if page_holds(page0, &image) {
-        return Ok(false);
+        return false;
     }
     if all_zero(page0) || page_holds(page0, raw) {
-        pwrite_exact(file, path, 0, &image)?;
-        return Ok(true);
+        view.write(0, &image);
+        return true;
     }
-    Ok(false)
+    false
 }
 
 fn page_holds(page: &[u8], image: &[u8]) -> bool {
@@ -507,19 +675,17 @@ fn recorded_len(best: Option<&TailSlot>, stem: usize, published: u64, image_len:
 }
 
 fn restore_tail_block(
-    file: &File,
-    path: &Path,
+    view: &mut StemView,
     stem: usize,
     published: u64,
-    file_len: u64,
     best: Option<&TailSlot>,
 ) -> Result<bool, StoreError> {
-    let (off, n) = tail_span(published, file_len);
+    let (off, n) = tail_span(published, view.len);
     if n == 0 || off < PAGE as u64 {
         return Ok(false);
     }
     let mut prefix = vec![0u8; n as usize];
-    pread_exact(file, path, off, &mut prefix)?;
+    view.read(off, &mut prefix)?;
     if !all_zero(&prefix) {
         return Ok(false);
     }
@@ -531,7 +697,7 @@ fn restore_tail_block(
     }
     let image = image_of(slot, stem);
     let take = (n as usize).min(image.len());
-    pwrite_exact(file, path, off, &image[..take])?;
+    view.write(off, &image[..take]);
     Ok(true)
 }
 
@@ -546,8 +712,7 @@ fn zero_tail_is_record(name: &str) -> bool {
 
 /// Stop when a zeroed prefix had no usable image to put back.
 fn refuse_zero_prefix(
-    file: &File,
-    path: &Path,
+    view: &StemView,
     name: &str,
     published: u64,
     file_len: u64,
@@ -559,7 +724,7 @@ fn refuse_zero_prefix(
     if flags.page0_unrestored {
         let page_n = (file_len as usize).min(PAGE).min(published as usize);
         let mut page0 = vec![0u8; page_n];
-        pread_exact(file, path, 0, &mut page0)?;
+        view.read(0, &mut page0)?;
         if all_zero(&page0) {
             return Err(StoreError::Corrupt(CORRUPT_PAGE));
         }
@@ -571,7 +736,7 @@ fn refuse_zero_prefix(
         && !(flags.no_slot && zero_tail_is_record(name))
     {
         let mut prefix = vec![0u8; n as usize];
-        pread_exact(file, path, off, &mut prefix)?;
+        view.read(off, &mut prefix)?;
         if all_zero(&prefix) {
             return Err(StoreError::Corrupt(CORRUPT_PAGE));
         }

@@ -8,7 +8,8 @@ crates/rbitcoin-store/src/bulk_io.rs	pwrite	1
 crates/rbitcoin-store/src/bulk_io.rs	pwrite_batch	1
 crates/rbitcoin-store/src/chain.rs	truncate	2
 crates/rbitcoin-store/src/class_a_legacy.rs	pwrite	1
-crates/rbitcoin-store/src/class_a_legacy.rs	pwrite_exact	5
+crates/rbitcoin-store/src/class_a_legacy.rs	pwrite_exact	2
+crates/rbitcoin-store/src/class_a_legacy.rs	write_all	1
 crates/rbitcoin-store/src/create_loc.rs	truncate	1
 crates/rbitcoin-store/src/delta_loc.rs	truncate	1
 crates/rbitcoin-store/src/file.rs	handle_pwrite_all	3

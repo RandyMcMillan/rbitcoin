@@ -60,6 +60,7 @@ fn a_class_a_barrier_writes_no_page_image() {
         "a barrier wrote tear_guard/"
     );
     let s = Store::open_tiny(&dir).unwrap();
+    assert_eq!(s.txs.count(), 130, "open kept the unnamed create");
     assert_eq!(s.txs.txids.get(Fk(130)).unwrap(), [130u8; 32]);
     drop(s);
     let _ = std::fs::remove_dir_all(&dir);
@@ -225,6 +226,10 @@ fn open_restores_a_torn_page_from_a_legacy_tear_guard() {
     assert_eq!(s.txs.txids.get(Fk(130)).unwrap(), [130u8; 32]);
     drop(s);
     assert!(!dir.join("tear_guard").exists(), "open left tear_guard/");
+    assert!(
+        !dir.join("tear_guard.plan").exists(),
+        "open left its restore plan"
+    );
     assert_eq!(std::fs::read(&txid).unwrap(), before);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -255,9 +260,137 @@ fn open_drops_a_clean_legacy_tear_guard() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A `.kept` name outside the legacy stems is not a legacy image. Open
+/// leaves such a file or directory alone.
+#[test]
+fn open_leaves_an_unrelated_kept_name() {
+    let dir = tmp();
+    store_130(&dir);
+    std::fs::write(dir.join("backup.kept"), b"operator bytes").unwrap();
+    std::fs::create_dir_all(dir.join("snap.kept")).unwrap();
+    let s = Store::open_tiny(&dir).unwrap();
+    drop(s);
+    assert_eq!(
+        std::fs::read(dir.join("backup.kept")).unwrap(),
+        b"operator bytes"
+    );
+    assert!(dir.join("snap.kept").is_dir(), "open removed snap.kept/");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A 130-create store, its `txid.body` bytes, and that stem's partial last block.
+fn store_with_txid_tail(dir: &Path) -> (std::path::PathBuf, Vec<u8>, u64, usize) {
+    store_130(dir);
+    let txid = dir.join("txid.body");
+    let before = std::fs::read(&txid).unwrap();
+    let (off, n) = legacy_tail_span(logical_of(&txid), before.len() as u64);
+    assert!(off >= PAGE as u64 && n > 8, "txid.body tail is {n} bytes");
+    (txid, before, off, n)
+}
+
+/// A restore write that stops after a nonzero prefix leaves the guard. The
+/// next open finishes that restore instead of reading the prefix as intact.
+#[cfg(debug_assertions)]
+#[test]
+fn a_short_legacy_restore_write_resumes_on_reopen() {
+    use rbitcoin_store::io_handle::{arm_short_pwrite_len, disarm_thread_writes};
+    let dir = tmp();
+    let (txid, before, off, n) = store_with_txid_tail(&dir);
+    write_legacy_guard(&dir);
+    zero_at(&txid, off, n);
+    arm_short_pwrite_len(n, 1);
+    let first = TxTable::open_tiny(&dir);
+    disarm_thread_writes();
+    assert!(first.is_err(), "the short restore write did not fail open");
+    assert!(
+        dir.join("tear_guard").exists(),
+        "a failed restore dropped tear_guard/"
+    );
+    let mut torn = vec![0u8; n];
+    read_at(&txid, off, &mut torn);
+    assert!(
+        torn.iter().any(|b| *b != 0),
+        "the hook missed the restore write"
+    );
+    assert_ne!(
+        torn,
+        before[off as usize..off as usize + n],
+        "the write was not short"
+    );
+    let s = Store::open_tiny(&dir).unwrap();
+    assert_eq!(s.txs.txids.get(Fk(130)).unwrap(), [130u8; 32]);
+    drop(s);
+    assert!(!dir.join("tear_guard").exists(), "open left tear_guard/");
+    assert_eq!(std::fs::read(&txid).unwrap(), before);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A restore whose stem sync fails leaves the guard, and so does a retry
+/// whose sync fails: the guard goes only after a synced restore.
+#[cfg(debug_assertions)]
+#[test]
+fn a_failed_legacy_restore_sync_keeps_the_guard() {
+    use rbitcoin_store::io_handle::{arm_fail_sync_on_thread, disarm_thread_writes};
+    let dir = tmp();
+    let (txid, before, off, n) = store_with_txid_tail(&dir);
+    write_legacy_guard(&dir);
+    zero_at(&txid, off, n);
+    for attempt in ["first", "retry"] {
+        arm_fail_sync_on_thread(1);
+        let r = TxTable::open_tiny(&dir);
+        disarm_thread_writes();
+        assert!(r.is_err(), "the {attempt} open took a failed sync");
+        assert!(
+            dir.join("tear_guard").exists(),
+            "the {attempt} open dropped tear_guard/ over an unsynced restore"
+        );
+        assert_eq!(std::fs::read(&txid).unwrap(), before);
+    }
+    let s = Store::open_tiny(&dir).unwrap();
+    drop(s);
+    assert!(!dir.join("tear_guard").exists(), "open left tear_guard/");
+    assert_eq!(std::fs::read(&txid).unwrap(), before);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `.kept` write that stops after a nonzero prefix leaves the `.kept`.
+/// The next open finishes that write.
+#[cfg(debug_assertions)]
+#[test]
+fn a_short_kept_restore_write_resumes_on_reopen() {
+    use rbitcoin_store::io_handle::{arm_short_pwrite_len, disarm_thread_writes};
+    let dir = tmp();
+    let (txid, before, off, n) = store_with_txid_tail(&dir);
+    let mut kept = Vec::new();
+    kept.extend_from_slice(b"CATK");
+    kept.extend_from_slice(&off.to_le_bytes());
+    kept.extend_from_slice(&(n as u32).to_le_bytes());
+    kept.extend_from_slice(&before[off as usize..off as usize + n]);
+    let side = dir.join("txid.body.kept");
+    std::fs::write(&side, kept).unwrap();
+    zero_at(&txid, off, n);
+    arm_short_pwrite_len(n, 1);
+    let first = TxTable::open_tiny(&dir);
+    disarm_thread_writes();
+    assert!(first.is_err(), "the short .kept write did not fail open");
+    assert!(side.exists(), "a failed restore dropped the .kept");
+    let mut torn = vec![0u8; n];
+    read_at(&txid, off, &mut torn);
+    assert!(
+        torn.iter().any(|b| *b != 0),
+        "the hook missed the .kept write"
+    );
+    let s = Store::open_tiny(&dir).unwrap();
+    drop(s);
+    assert!(!side.exists(), "open left the .kept");
+    assert_eq!(std::fs::read(&txid).unwrap(), before);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Two tail slots that both fail to decode, a `.kept` that is not a `CATK`
-/// image, or a sealed page 0 whose commit fails its checksum may hold the
-/// only copy of a page. Open refuses and leaves them on disk.
+/// image, a sealed page 0 whose commit fails its checksum, or a restore plan
+/// that does not decode may hold the only copy of a page. Open refuses and
+/// leaves them on disk.
 #[test]
 fn open_refuses_an_unparsable_legacy_image() {
     let dir = tmp();
@@ -286,6 +419,13 @@ fn open_refuses_an_unparsable_legacy_image() {
     std::fs::write(&first, raw).unwrap();
     assert!(is_corrupt(Store::open_tiny(&dir)), "open took a bad seal");
     assert!(first.exists(), "open removed a bad seal");
+    std::fs::remove_dir_all(&guard).unwrap();
+    write_legacy_guard(&dir);
+    let plan = dir.join("tear_guard.plan");
+    std::fs::write(&plan, b"CAPR not a plan").unwrap();
+    assert!(is_corrupt(Store::open_tiny(&dir)), "open took a bad plan");
+    assert!(plan.exists(), "open removed a bad plan");
+    assert!(guard.exists(), "open removed the guard beside a bad plan");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

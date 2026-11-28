@@ -43,6 +43,14 @@ fn armed_map() -> &'static Mutex<HashMap<PathBuf, HashSet<u64>>> {
     ARMED.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Per `guard/` directory, the live files a mark change dropped whose
+/// directory sync failed. The next sync of that directory makes the change
+/// durable and releases them, even when the retry itself drops nothing.
+fn pending_release_map() -> &'static Mutex<HashMap<PathBuf, HashSet<PathBuf>>> {
+    static PENDING: OnceLock<Mutex<HashMap<PathBuf, HashSet<PathBuf>>>> = OnceLock::new();
+    PENDING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn guard_live_dir(mark: &Path) -> Option<&Path> {
     mark.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -61,9 +69,17 @@ fn remember_group(mark: &Path, pages: &[(&str, u64, &[u8])], leftover: &[(String
     for &(file, offset, _) in pages {
         by_file.entry(file.to_string()).or_default().insert(offset);
     }
+    // A new arm owns these files now: a later sync must not release it.
+    let mut pending = pending_release_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let mut map = armed_map().lock().unwrap_or_else(|e| e.into_inner());
     for (file, offs) in by_file {
-        map.insert(dir.join(file), offs);
+        let path = dir.join(file);
+        for set in pending.values_mut() {
+            set.remove(&path);
+        }
+        map.insert(path, offs);
     }
 }
 
@@ -95,14 +111,23 @@ fn live_paths(mark: &Path, names: &HashSet<String>) -> Vec<PathBuf> {
 /// Sync the guard directory after a mark change that drops `released`.
 /// A file is released only once that change is durable. Until then a crash
 /// can bring the old mark back, and open would copy its images over a later
-/// write, so a failed sync blocks the file instead.
+/// write, so a failed sync blocks the file and keeps it pending. A later
+/// sync of the same directory releases every pending file with `released`.
 fn sync_mark_dir_then_release(parent: &Path, released: &[PathBuf]) -> Result<(), StoreError> {
     let synced = sync_mark_dir(parent);
-    for path in released {
-        if synced.is_ok() {
+    let mut pending = pending_release_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if synced.is_ok() {
+        let earlier = pending.remove(parent).unwrap_or_default();
+        for path in earlier.iter().chain(released) {
             forget_armed(path);
-        } else {
+        }
+    } else {
+        let set = pending.entry(parent.to_path_buf()).or_default();
+        for path in released {
             block_armed(path);
+            set.insert(path.clone());
         }
     }
     synced

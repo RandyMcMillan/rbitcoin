@@ -197,6 +197,17 @@ fn page0_guard_restores_the_free_list_and_hides_the_bump() {
         free, freed,
         "page 0 did not restore the pre-commit free list"
     );
+    // The slab at `freed` must read as a free-list link again, not as the
+    // discarded bump's records.
+    put_create_batch(&s.scripthash, [rec(b, 10), rec(b, 11)]);
+    let ShHeadValue::Slab { off, .. } = s.scripthash.head_value(&b).unwrap().unwrap() else {
+        panic!("two creates must be a slab");
+    };
+    assert_eq!(
+        off, freed,
+        "the append did not reuse the restored free slab"
+    );
+    assert_eq!(create_fks(&s.scripthash, &b), vec![10, 11]);
 }
 
 /// A wipe leaves no `store/guard/sh-*`.
@@ -710,7 +721,25 @@ fn seal_refuses_while_a_commit_guard_is_armed() {
     let marks = sh_marks(&dir);
     assert!(!marks.is_empty(), "the failed clear leaves the mark");
     let before: Vec<Vec<u8>> = marks.iter().map(|m| std::fs::read(m).unwrap()).collect();
-    assert!(t.seal_ingest().is_err(), "sealed over an armed guard");
+    let err = t.seal_ingest().expect_err("sealed over an armed guard");
+    assert!(
+        matches!(
+            err,
+            StoreError::Rejected(
+                "scripthash: a commit guard is still armed; restart to restore it before a seal"
+            )
+        ),
+        "{err}"
+    );
+    assert_eq!(
+        sealed_segment_files(&dir),
+        0,
+        "the refused seal left a segment"
+    );
+    assert!(
+        t.ingest.lock().unwrap().is_some(),
+        "the refused seal dropped ingest"
+    );
     let after: Vec<Vec<u8>> = sh_marks(&dir)
         .iter()
         .map(|m| std::fs::read(m).unwrap())
@@ -735,14 +764,15 @@ fn gap_links_wait_for_the_arm() {
         .chain(t.ovf_body.iter())
         .map(|b| b.path().to_path_buf())
         .collect();
-    // A file where guard/ belongs makes the next arm fail.
-    let guard = dir.join("guard");
-    let _ = std::fs::remove_dir_all(&guard);
-    std::fs::write(&guard, b"not a directory").unwrap();
     let many: Vec<ScriptHashRecord> = (4..=600u64).map(|i| rec(key, i)).collect();
+    rbitcoin_store::page_guard::fail_next_arm_dir_sync(&dir.join("guard"));
     rbitcoin_store::file::arm_write_trace();
-    assert!(t.put_create_batch_append(&many).is_err());
+    let err = t.put_create_batch_append(&many).unwrap_err();
     let trace = rbitcoin_store::file::take_write_trace();
+    assert!(
+        format!("{err:?}").contains("injected guard directory sync failure"),
+        "the append failed before its arm: {err:?}"
+    );
     for w in trace {
         if let TracedWrite::Write { path, offset, len } = w {
             assert!(
@@ -768,8 +798,23 @@ fn deferred_empty_commit_restores_the_head_and_chain() {
         let fks: Vec<Fk> = (1..=n).map(Fk).collect();
         t.unlink_creates_batch(&[(sh, fks)]).unwrap();
         assert!(t.deferred_empty(&sh));
+        assert!(
+            t.head_value(&sh).unwrap().is_some(),
+            "the head names the chain"
+        );
         t.fail_next_sh_guard_clear();
-        assert!(t.commit_deferred_empty_heads().is_err());
+        let err = t.commit_deferred_empty_heads().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::Corrupt("scripthash page guard clear failed")
+            ),
+            "the commit failed before its clear: {err}"
+        );
+        assert!(
+            t.head_value(&sh).unwrap().is_none(),
+            "the empty commit did not write the head"
+        );
         assert!(!sh_marks(&dir).is_empty(), "the crash leaves the mark");
     }
     let t = ScriptHashTable::open_tiny(&dir).unwrap();
@@ -943,8 +988,18 @@ fn deferred_empty_retry_rearms_after_a_sibling_clear() {
     ScriptHashTable::fail_next_deferred_free();
     assert!(t.commit_deferred_empty_heads().is_err());
     assert!(t.deferred_empty(&a) != t.deferred_empty(&b));
+    assert!(
+        sh_marks(&dir).is_empty(),
+        "the sibling's clear left the failed job's mark"
+    );
     ScriptHashTable::fail_next_deferred_free();
+    rbitcoin_store::page_guard::arm_store_mark_trace();
     assert!(t.commit_deferred_empty_heads().is_err());
+    let armed = rbitcoin_store::page_guard::take_armed_store_marks();
+    assert!(
+        armed.iter().any(|m| m == "guard/sh-ovf"),
+        "the retry wrote under no new mark: {armed:?}"
+    );
     assert!(
         !sh_marks(&dir).is_empty(),
         "the retry wrote under no mark after the sibling cleared it"

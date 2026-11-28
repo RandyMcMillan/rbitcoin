@@ -887,17 +887,22 @@ fn clear_sh_marks_forgets_the_armed_pages() {
 /// `clear_sh_marks` can unlink a mark and then fail its directory sync. A
 /// retry finds no `sh-*` mark, and it must still sync `guard/` before the
 /// caller rebuilds the index, or the unlink can be undone by power loss.
+/// The failed sync blocks the file; the synced retry releases it.
 // Windows has no directory fsync, so nothing is recorded there.
 #[cfg(all(unix, debug_assertions))]
 #[test]
 fn clear_sh_marks_retry_syncs_the_guard_dir() {
     let dir = TempDir::labeled("page-guard-sh-retry").unwrap();
-    let _ = committed_body(&dir);
+    let (file, _path) = committed_body(&dir);
     arm_page0(&dir, "guard/sh-ovf");
     let guard = dir.path().join("guard");
     rbitcoin_store::page_guard::fail_next_mark_dir_sync(&guard);
     assert!(clear_sh_marks(dir.path()).is_err());
     assert!(!guard.join("sh-ovf").exists(), "the unlink landed");
+    assert!(
+        file.write_at(PAGE as u64 + 256, &[0x44; 16]).is_err(),
+        "the file took a write before the unlink was durable"
+    );
     rbitcoin_store::file::arm_fsync_dir_trace();
     clear_sh_marks(dir.path()).unwrap();
     let synced = rbitcoin_store::file::take_fsynced_dirs();
@@ -905,6 +910,8 @@ fn clear_sh_marks_retry_syncs_the_guard_dir() {
         synced.contains(&guard),
         "a retry with no mark syncs guard/: {synced:?}"
     );
+    file.write_at(PAGE as u64, &[0x77; 16])
+        .expect("the synced retry releases the file");
 }
 
 /// A clear that unlinks the mark and then fails its directory sync blocks

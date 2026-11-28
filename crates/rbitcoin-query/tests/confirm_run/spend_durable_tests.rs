@@ -1661,3 +1661,61 @@ fn a_same_block_spend_of_a_fresh_parent_reads_no_slot() {
     );
     let _ = dir;
 }
+
+/// A parent created in an earlier block of this write batch has no spend
+/// record yet. Its slot is empty, so structural does not read it. A parent
+/// from before the batch still is read.
+#[test]
+fn a_same_batch_spend_of_an_earlier_block_skips_the_slot_read() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("spend-same-batch-no-read");
+    q.set_spend_index(true);
+    let params = ChainParams::regtest();
+    let ms = Milestone::NONE;
+    let maturity = params.coinbase_maturity();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let b1 = mine(
+        genesis.block_hash(),
+        genesis.header.time + 600,
+        1,
+        Vec::new(),
+    );
+    let c1 = b1.txdata[0].compute_txid();
+    accept_and_connect_block(&q, &params, Height(1), &b1, ms).unwrap();
+    let mut tip = b1.block_hash();
+    let mut tip_time = b1.header.time;
+    connect_until(&q, &params, ms, &mut tip, &mut tip_time, maturity + 2);
+
+    let h_parent = maturity + 3;
+    let parent = pay_many(c1, 1, Amount::from_sat(16_0000_0000));
+    let pid = parent.compute_txid();
+    let parent_block = mine(tip, tip_time + 600, h_parent, vec![parent]);
+    let h_child = h_parent + 1;
+    let child = spend_vout(pid, 0, Amount::from_sat(15_0000_0000));
+    let child_block = mine(
+        parent_block.block_hash(),
+        parent_block.header.time + 600,
+        h_child,
+        vec![child],
+    );
+
+    let _ = q.confirm_stats().take_window();
+    rbitcoin_query::confirm_wire_run(
+        &q,
+        &params,
+        ms,
+        &[
+            (Height(h_parent), parent_block),
+            (Height(h_child), child_block),
+        ],
+    )
+    .unwrap();
+    let reads = q.confirm_stats().take_window().spend_meta_n;
+    assert!(q.is_outpoint_spent(c1.as_byte_array(), 0).unwrap());
+    assert!(q.is_outpoint_spent(pid.as_byte_array(), 0).unwrap());
+    assert_eq!(
+        reads, 1,
+        "one read for the coinbase; the in-batch parent is not read"
+    );
+    let _ = dir;
+}

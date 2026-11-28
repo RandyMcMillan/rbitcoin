@@ -380,9 +380,22 @@ fn a_sync_that_cannot_read_its_header_ends_the_fresh_exemption() {
     assert_eq!(at(0), Some("MULTI_SECTOR"), "a synced header is not fresh");
 }
 
+/// Whether this filesystem punches holes. Where it does not, `zero_range`
+/// takes its write fallback.
+fn punches_holes(store: &Store) -> bool {
+    let path = store.path("punch-check");
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_len(8192).unwrap();
+    rbitcoin_store::file::try_punch_hole(&file, 0, 4096).is_ok()
+}
+
 #[test]
 fn a_punched_range_is_unsynced_until_a_sync() {
     let store = Store::new();
+    if !punches_holes(&store) {
+        // The fallback writes and publishes: the next test covers it.
+        return;
+    }
     let path = store.path("punch");
     let table = TableFile::create(&path, TableKind::TxOut).unwrap();
     table.sync_data_only().unwrap();
@@ -390,6 +403,19 @@ fn a_punched_range_is_unsynced_until_a_sync() {
     assert_eq!(publish(&path, 16, 16 + 8192), Some("LEN_BEFORE_SYNC"));
     table.sync_data_only().unwrap();
     assert_eq!(publish(&path, 16, 16 + 8192), Some("LEN_AFTER_SYNC"));
+}
+
+#[test]
+fn a_zeroed_range_without_a_punch_publishes_its_own_end() {
+    let store = Store::new();
+    let path = store.path("no-punch");
+    let table = TableFile::create(&path, TableKind::TxOut).unwrap();
+    table.sync_data_only().unwrap();
+    rbitcoin_store::file::skip_next_punch_hole(&path);
+    table.zero_range(16, 8192).unwrap();
+    // The fallback's own length write landed the end, so republishing it
+    // changes no byte past one sector.
+    assert_eq!(publish(&path, 16, 16 + 8192), Some("ONE_SECTOR"));
 }
 
 #[test]

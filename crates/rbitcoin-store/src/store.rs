@@ -536,6 +536,7 @@ impl Store {
         let meta_ver = check_meta(&path)?;
         restore_open_marks(&layout)?;
         open_layout_refuse_old(&path, meta_ver)?;
+        open_layout_rewrite_spend_delta(&path, meta_ver)?;
         drop_unread_store_leftovers(&path);
         let (scripthash, header_txs) =
             open_or_create_scripthash_header_txs(&path, layout.head_scale)?;
@@ -2832,7 +2833,7 @@ fn open_or_create_scripthash_header_txs(
 /// writes would land in a page log the published delta ignores. The 29
 /// files go once `meta` 30 is durable.
 ///
-/// The hole cut's flush arms the first mark, which moves `meta` to 31.
+/// `meta` is current before the hole cut's flush arms the first mark.
 /// Only after the adoption: before it, a 31 `meta` beside a populated
 /// `spent.body` with no `spent.delta/` refuses.
 fn finish_spend_delta_adoption(
@@ -2865,6 +2866,18 @@ pub fn drop_leftover_tx_height(path: &Path) {
 /// datadir, and to [`SCHEMA_VERSION`] only once the spend delta has adopted
 /// the old `spent.body` ([`open_layout_rewrite_current`]).
 const SCHEMA_BEFORE_SPEND_DELTA: u16 = 29;
+
+/// `meta` 30 to [`SCHEMA_VERSION`] before open writes anything else. A 30
+/// store already has its spend delta, so nothing waits on an adoption, and
+/// no page-guard mark is ever on disk beside a `meta` a 30 binary opens.
+/// Older `meta` reaches the current schema after the adoption
+/// ([`open_layout_rewrite_current`]); open arms no mark before that.
+fn open_layout_rewrite_spend_delta(path: &Path, meta_ver: u16) -> Result<(), StoreError> {
+    if meta_ver == 30 {
+        write_meta(path)?;
+    }
+    Ok(())
+}
 
 /// `meta` to [`SCHEMA_BEFORE_SPEND_DELTA`] when it is older.
 #[doc(hidden)]

@@ -807,6 +807,25 @@ fn plain_open_of_meta_30_rewrites_meta_to_31() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Open moves a schema-30 `meta` to 31 before anything else it writes, so
+/// no page-guard mark is ever on disk beside a `meta` a 30 binary opens. An
+/// open that fails after that point leaves 31.
+#[test]
+fn open_of_meta_30_writes_31_before_a_later_failure() {
+    let dir = tmp();
+    {
+        let s = Store::create_tiny(&dir).unwrap();
+        s.flush().unwrap();
+    }
+    write_store_meta_ver(&dir, 30);
+    let delta = dir.join("spent.delta");
+    std::fs::remove_dir_all(&delta).unwrap();
+    std::fs::write(&delta, b"x").unwrap();
+    assert!(Store::open_tiny(&dir).is_err());
+    assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A 26 datadir whose witness locator is already the finished cut must open,
 /// keep the creates, and rewrite meta to the current schema. A 26 binary
 /// wipes that layout.

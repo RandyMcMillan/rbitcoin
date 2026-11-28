@@ -441,9 +441,9 @@ fn clear_keeps_a_mark_of_an_unknown_kind() {
     assert_eq!(std::fs::read(&mark).unwrap(), raw);
 }
 
-/// A retry after the `meta` rename landed and its directory sync failed
-/// sees 31 and skips the promote. The arm still syncs the store directory
-/// that holds `meta` before it publishes the mark.
+/// An arm syncs the store directory that holds `meta` before it publishes
+/// the mark, so a `meta` rename whose directory sync failed is durable
+/// before any mark.
 #[test]
 fn arm_on_meta_31_syncs_the_directory_that_holds_meta() {
     let dir = TempDir::labeled("page-guard-meta-retry").unwrap();

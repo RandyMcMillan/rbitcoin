@@ -205,10 +205,10 @@ impl TipFault {
 /// refuses before any repair runs.
 ///
 /// The cut is in RAM. `true` means the caller flushes `confirmed` once the
-/// spend delta has adopted a pre-30 `spent.body`: the flush arms a mark,
-/// which moves `meta` to 31, and a 31 datadir with a populated body and no
-/// `spent.delta/` refuses. A stop before that flush cuts again at the next
-/// open.
+/// spend delta has adopted a pre-30 `spent.body` and `meta` is current. The
+/// flush arms a mark, which needs a current `meta`, and a current `meta`
+/// beside a populated body with no `spent.delta/` refuses. A stop before
+/// that flush cuts again at the next open.
 pub(crate) fn cut_or_refuse_confirmed_hole(
     dir: &Path,
     confirmed: &crate::chain::ConfirmedTable,

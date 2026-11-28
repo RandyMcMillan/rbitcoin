@@ -808,8 +808,8 @@ fn sealed_chain_with_tip_block_hole(s: &rbitcoin_store::Store) {
 
 /// An upgrade that cuts a hole in the sealed tip block and stops before the
 /// spend delta adopts `spent.body` leaves `meta` at 29 and arms no mark. A
-/// mark would publish `meta` 31 first, and a 31 datadir with a populated
-/// body and no `spent.delta/` refuses to open. The next open adopts the
+/// mark needs `meta` 31, and a 31 datadir with a populated body and no
+/// `spent.delta/` refuses to open. The next open adopts the
 /// spends, then makes the cut durable.
 #[cfg(debug_assertions)]
 #[test]
@@ -849,7 +849,7 @@ fn an_upgrade_stopped_after_the_tip_hole_cut_adopts_again() {
     assert_eq!(
         rbitcoin_store::store::check_meta(&d).unwrap(),
         31,
-        "the cut's flush after the adoption is the first mark"
+        "the reopen publishes 31 after the adoption"
     );
 }
 

@@ -340,22 +340,7 @@ pub fn restore_store_group(dir: &Path, mark: &str) -> Result<bool, StoreError> {
     restore_page_guard_group(&dir.join(mark), dir)
 }
 
-/// Promote `meta` to 31 when this directory is a datadir still on 30.
-///
-/// A table fixture with no `meta` still arms. A plain open does not call this.
-#[doc(hidden)]
-pub fn promote_meta_31(dir: &Path) -> Result<(), StoreError> {
-    match crate::store::check_meta(dir) {
-        Ok(ver) if ver < 31 => crate::store::write_meta_at(dir, 31),
-        Ok(_) => Ok(()),
-        Err(StoreError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
-            Ok(())
-        }
-        Err(e) => Err(e),
-    }
-}
-
-/// Arm a store group mark after `meta` is 31. Empty is a no-op.
+/// Arm a store group mark. Empty is a no-op.
 #[doc(hidden)]
 pub fn arm_store_group(
     dir: &Path,
@@ -365,7 +350,6 @@ pub fn arm_store_group(
     if pages.is_empty() {
         return Ok(());
     }
-    promote_meta_31(dir)?;
     arm_page_guard_group(&dir.join(mark), pages)
 }
 

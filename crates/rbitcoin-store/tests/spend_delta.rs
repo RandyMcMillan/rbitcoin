@@ -770,6 +770,7 @@ fn an_upgrade_killed_before_the_adoption_adopts_again() {
 
 /// Heights `0..20` sealed at the tip, then `confirmed[16]` nulled: the
 /// crash an older binary left in the block that holds the sealed tip.
+#[cfg(debug_assertions)]
 fn sealed_chain_with_tip_block_hole(s: &rbitcoin_store::Store) {
     use rbitcoin_primitives::{Fk, Height};
     use rbitcoin_store::header_table::{block_header_hash, HeaderRecord};
@@ -810,6 +811,7 @@ fn sealed_chain_with_tip_block_hole(s: &rbitcoin_store::Store) {
 /// mark would publish `meta` 31 first, and a 31 datadir with a populated
 /// body and no `spent.delta/` refuses to open. The next open adopts the
 /// spends, then makes the cut durable.
+#[cfg(debug_assertions)]
 #[test]
 fn an_upgrade_stopped_after_the_tip_hole_cut_adopts_again() {
     use rbitcoin_primitives::Height;

@@ -537,16 +537,8 @@ impl Store {
         restore_open_marks(&layout)?;
         open_layout_refuse_old(&path, meta_ver)?;
         drop_unread_store_leftovers(&path);
-        let scripthash = if path.join("scripthash.body").exists() {
-            ScriptHashTable::open_with_scale(&path, layout.head_scale)?
-        } else {
-            ScriptHashTable::create_with_scale(&path, layout.head_scale)?
-        };
-        let header_txs = if path.join("header_txs_first.body").exists() {
-            HeaderTxsTable::open(&path)?
-        } else {
-            HeaderTxsTable::create(&path)?
-        };
+        let (scripthash, header_txs) =
+            open_or_create_scripthash_header_txs(&path, layout.head_scale)?;
         let confirmed = ConfirmedTable::open(&path)?;
         let hole_cut = crate::integrity::cut_or_refuse_confirmed_hole(&path, &confirmed)?;
         let height_fence = HeightFence::from_confirmed(&confirmed, &header_txs)?;
@@ -567,19 +559,7 @@ impl Store {
                 schema: meta_ver,
             }),
         )?;
-        // Right after the spend delta published its adoption of a pre-30
-        // `spent.body` (#2038). Before it a crash opens as pre-30 and adopts
-        // again. After it no schema-29 binary may open the datadir: its spend
-        // writes would land in a page log the published delta ignores. The
-        // 29 files go once `meta` 30 is durable.
-        open_layout_rewrite_current(&path, meta_ver)?;
-        crate::spend_pages_v29::remove(&path)?;
-        // The hole cut's flush arms the first mark, which moves `meta` to 31.
-        // Only after the adoption: before it, a 31 `meta` beside a populated
-        // `spent.body` with no `spent.delta/` refuses.
-        if hole_cut {
-            confirmed.flush()?;
-        }
+        finish_spend_delta_adoption(&path, meta_ver, &confirmed, hole_cut)?;
         if layout.is_split() {
             write_seqsigwit_reloc(&path)?;
         }
@@ -2825,6 +2805,48 @@ pub fn drop_unread_store_leftovers(path: &Path) {
              (schema 17 uses segmented dirs; --sp-tweaks backfill regenerates)"
         );
     }
+}
+
+/// Open `scripthash` and `header_txs`, creating either one when its body
+/// file is missing.
+fn open_or_create_scripthash_header_txs(
+    path: &Path,
+    head_scale: HeadScale,
+) -> Result<(ScriptHashTable, HeaderTxsTable), StoreError> {
+    let scripthash = if path.join("scripthash.body").exists() {
+        ScriptHashTable::open_with_scale(path, head_scale)?
+    } else {
+        ScriptHashTable::create_with_scale(path, head_scale)?
+    };
+    let header_txs = if path.join("header_txs_first.body").exists() {
+        HeaderTxsTable::open(path)?
+    } else {
+        HeaderTxsTable::create(path)?
+    };
+    Ok((scripthash, header_txs))
+}
+
+/// Runs right after the spend delta published its adoption of a pre-30
+/// `spent.body` (#2038). Before it a crash opens as pre-30 and adopts
+/// again. After it no schema-29 binary may open the datadir: its spend
+/// writes would land in a page log the published delta ignores. The 29
+/// files go once `meta` 30 is durable.
+///
+/// The hole cut's flush arms the first mark, which moves `meta` to 31.
+/// Only after the adoption: before it, a 31 `meta` beside a populated
+/// `spent.body` with no `spent.delta/` refuses.
+fn finish_spend_delta_adoption(
+    path: &Path,
+    meta_ver: u16,
+    confirmed: &ConfirmedTable,
+    hole_cut: bool,
+) -> Result<(), StoreError> {
+    open_layout_rewrite_current(path, meta_ver)?;
+    crate::spend_pages_v29::remove(path)?;
+    if hole_cut {
+        confirmed.flush()?;
+    }
+    Ok(())
 }
 
 #[doc(hidden)]

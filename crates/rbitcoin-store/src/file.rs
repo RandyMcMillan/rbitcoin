@@ -1030,6 +1030,30 @@ impl TableFile {
         )
     }
 
+    /// Write probe: a zeroed range, in the chunks the fallback writes.
+    #[cfg(feature = "write-probe")]
+    fn probe_zero(
+        &self,
+        committed: u64,
+        offset: u64,
+        len: u64,
+    ) -> Vec<crate::write_probe::Landing> {
+        let zero = vec![0u8; len.min(1024 * 1024) as usize];
+        let mut out = Vec::new();
+        let mut at = 0u64;
+        while at < len {
+            let n = ((len - at) as usize).min(zero.len());
+            out.push(self.probe(
+                committed,
+                offset + at,
+                &zero[..n],
+                crate::write_probe::WriteKind::Payload,
+            ));
+            at += n as u64;
+        }
+        out
+    }
+
     /// Write probe: the handle that holds this file's leading header. A
     /// trailing table has none.
     #[cfg(feature = "write-probe")]
@@ -1529,6 +1553,10 @@ impl TableFile {
         let committed = self.header_len_to_persist();
         crate::page_guard::check_armed_write(&self.path, committed, offset, len)?;
         self.ensure_capacity(offset.saturating_add(len))?;
+        // The punch changes these bytes like the fallback's writes do, so the
+        // probe records the same payload ranges.
+        #[cfg(feature = "write-probe")]
+        let _landings = self.probe_zero(committed, offset, len);
         let file = self.file.lock().unwrap();
         #[cfg(debug_assertions)]
         let punched = !take_no_punch_hole(&self.path) && try_punch_hole(&file, offset, len).is_ok();

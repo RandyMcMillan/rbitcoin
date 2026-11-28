@@ -364,3 +364,30 @@ fn only_a_fresh_table_header_write_is_create() {
     assert_eq!(at(0), Some("MULTI_SECTOR"));
     assert_eq!(at(16), None);
 }
+
+#[test]
+fn a_sync_that_cannot_read_its_header_ends_the_fresh_exemption() {
+    let store = Store::new();
+    let path = store.path("unread");
+    let _table = TableFile::create(&path, TableKind::TxOut).unwrap();
+    let at = |offset| classify(&path, 16, offset, &[0; 1024], false, 16, WriteKind::Payload).0;
+    assert_eq!(at(0), Some("CREATE"));
+    // A handle too short to hold a header: the sync cannot read the end.
+    let short = store.path("short");
+    std::fs::write(&short, b"").unwrap();
+    let short = std::fs::File::open(&short).unwrap();
+    synced(&path, sync_begin(&path, Some(&short)));
+    assert_eq!(at(0), Some("MULTI_SECTOR"), "a synced header is not fresh");
+}
+
+#[test]
+fn a_punched_range_is_unsynced_until_a_sync() {
+    let store = Store::new();
+    let path = store.path("punch");
+    let table = TableFile::create(&path, TableKind::TxOut).unwrap();
+    table.sync_data_only().unwrap();
+    table.zero_range(16, 8192).unwrap();
+    assert_eq!(publish(&path, 16, 16 + 8192), Some("LEN_BEFORE_SYNC"));
+    table.sync_data_only().unwrap();
+    assert_eq!(publish(&path, 16, 16 + 8192), Some("LEN_AFTER_SYNC"));
+}

@@ -65,9 +65,16 @@ pub fn sync_begin(path: &Path, file: Option<&std::fs::File>) -> SyncPoint {
     let mut t = ends().lock().unwrap_or_else(|e| e.into_inner());
     let cover = t.version();
     let trailer = t.trailer.get(path).and_then(End::latest);
-    let header = file
-        .and_then(|f| header_on(f, path))
-        .or_else(|| t.header.get(path).and_then(End::latest));
+    let recorded = t.header.get(path).and_then(End::latest);
+    // A leading table whose header cannot be read still has one on disk
+    // once this sync returns: at least the bare header is durable, so the
+    // fresh-file exemption ends here.
+    let header = match file {
+        Some(f) => header_on(f, path)
+            .or(recorded)
+            .or(Some(crate::file::FILE_HEADER_LEN as u64)),
+        None => recorded,
+    };
     SyncPoint {
         seq,
         cover,

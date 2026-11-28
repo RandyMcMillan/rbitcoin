@@ -45,6 +45,11 @@ RULES = [
     (r"LEN_BEFORE_SYNC", r"scripthash\.body/",
      r"scripthash_materialize::pack_and_seal_unsorted_shard|ScriptHashBulkSession::finish_pack",
      "cold pack body: open trusts a shard only by its NN.packed mark, written after the body sync"),
+    # A new head generation sets its length, zeroes its slot table (already
+    # zero in a new sparse file), then syncs the file and its directory
+    # before anything can name it. No byte below that length was durable.
+    (r"MULTI_SECTOR", r"header\.head", r"HashHead::create_with_slots",
+     "new head generation: slot table zeroed before its first sync"),
     (r"MULTI_SECTOR", r"scripthash", r"unlink::restore_page|unlink::arm_undo|recover_unlink_undos",
      "legacy unlink undo replay at open, or its test hook"),
     (r"MULTI_SECTOR", r"blockfilter\.body", r"repair_body|repaired_filter_body",

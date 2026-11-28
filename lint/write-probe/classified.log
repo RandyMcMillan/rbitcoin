@@ -6,3 +6,5 @@ PROBE MULTI_SECTOR scripthash.ovf/ingest rbitcoin_store::scripthash_materialize:
     rbitcoin_store::scripthash_materialize::pack_and_seal_unsorted_shard
 PROBE LEN_BEFORE_SYNC scripthash.body/ rbitcoin_store::scripthash_materialize::pack_and_seal_unsorted_shard#44431f02e38aab78 end=4096 off=8 len=8
     rbitcoin_store::scripthash_materialize::materialize_sh_from_unsorted_from_txs
+PROBE MULTI_SECTOR <tmp>/header.head.g rbitcoin_store::hashhead::HashHead::create_with_slots#1c3f606c606763e8 end=3088 off=16 len=3072
+    rbitcoin_store::header_table::HeaderHead::roll

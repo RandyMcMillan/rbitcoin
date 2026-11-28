@@ -176,6 +176,10 @@ struct End {
     durable: Option<(u64, Option<u64>)>,
     /// (version, end), oldest first.
     written: Vec<(u64, u64)>,
+    /// (version, end) of length writes that returned `Err`. Part of one may
+    /// be on disk, so its end stays possible until a later length write that
+    /// landed is synced. It is never the end a sync makes durable.
+    attempted: Vec<(u64, u64)>,
 }
 
 impl End {
@@ -192,6 +196,15 @@ impl End {
             return;
         }
         let end = end.or_else(|| self.durable.and_then(|(_, end)| end));
+        if let Some(ok) = self
+            .written
+            .iter()
+            .filter(|&&(v, _)| v <= cover)
+            .map(|&(v, _)| v)
+            .max()
+        {
+            self.attempted.retain(|&(v, _)| v > ok);
+        }
         self.durable = Some((cover, end));
         self.written.retain(|&(v, _)| v > cover);
     }
@@ -202,6 +215,7 @@ impl End {
             .and_then(|(_, end)| end)
             .into_iter()
             .chain(self.written.iter().map(|&(_, end)| end))
+            .chain(self.attempted.iter().map(|&(_, end)| end))
     }
 
     /// Created this process and never synced.
@@ -250,17 +264,19 @@ impl Ends {
             End {
                 durable: Some((version, None)),
                 written: Vec::new(),
+                attempted: Vec::new(),
             },
         );
     }
 
-    fn written(&mut self, side: Side, path: &Path, end: u64) {
+    fn written(&mut self, side: Side, path: &Path, end: u64, ok: bool) {
         let version = self.version();
-        self.side(side)
-            .entry(path.to_path_buf())
-            .or_default()
-            .written
-            .push((version, end));
+        let rec = self.side(side).entry(path.to_path_buf()).or_default();
+        if ok {
+            rec.written.push((version, end));
+        } else {
+            rec.attempted.push((version, end));
+        }
     }
 }
 
@@ -306,21 +322,36 @@ fn unsynced_in(path: &Path, from: u64, to: u64) -> bool {
 /// once the write returns, `Ok` or `Err`: a failed write may have landed
 /// some bytes. A payload range takes its sequence number then, so a sync
 /// that began while it was in flight does not clear it. A length (footer or
-/// leading header) becomes a written end only through [`Landing::landed`]:
-/// after an `Err` the file's length is unknown, so the previous ends stay.
+/// leading header) becomes a written end only through [`Landing::landed`].
+/// After [`Landing::failed`] part of it may be on disk, so its end is kept
+/// as possible but never made durable, and the previous ends stay.
 #[must_use = "hold it until the write returns"]
 #[doc(hidden)]
 pub struct Landing {
     path: PathBuf,
     payload: Option<u64>,
     length: Option<(Side, u64)>,
-    ok: bool,
+    outcome: Outcome,
+}
+
+/// How a length write ended. A Landing dropped with neither call was only a
+/// classification (a probe query) and records no end.
+#[derive(Clone, Copy, PartialEq)]
+enum Outcome {
+    Unknown,
+    Landed,
+    Failed,
 }
 
 impl Landing {
     /// The write returned `Ok`.
     pub fn landed(mut self) {
-        self.ok = true;
+        self.outcome = Outcome::Landed;
+    }
+
+    /// The write returned `Err`: part of it may be on disk.
+    pub fn failed(mut self) {
+        self.outcome = Outcome::Failed;
     }
 }
 
@@ -336,11 +367,17 @@ impl Drop for Landing {
                 }
             }
         }
-        if let Some((side, end)) = self.length.filter(|_| self.ok) {
-            ends()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .written(side, &self.path, end);
+        // A length that returned `Err` may have landed in part: its end
+        // stays possible, but never becomes durable.
+        if let Some((side, end)) = self.length {
+            if self.outcome != Outcome::Unknown {
+                ends().lock().unwrap_or_else(|e| e.into_inner()).written(
+                    side,
+                    &self.path,
+                    end,
+                    self.outcome == Outcome::Landed,
+                );
+            }
         }
     }
 }
@@ -390,7 +427,7 @@ pub fn classify(
         path: path.to_path_buf(),
         payload: None,
         length: None,
-        ok: false,
+        outcome: Outcome::Unknown,
     };
     let len = bytes.len() as u64;
     if len == 0 {

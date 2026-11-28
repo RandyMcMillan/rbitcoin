@@ -391,3 +391,25 @@ fn a_punched_range_is_unsynced_until_a_sync() {
     table.sync_data_only().unwrap();
     assert_eq!(publish(&path, 16, 16 + 8192), Some("LEN_AFTER_SYNC"));
 }
+
+#[test]
+fn a_failed_footer_write_keeps_its_attempted_end_possible() {
+    let store = Store::new();
+    let path = store.path("footer-attempted");
+    opened_trailing(&path, 4096);
+    // The write returned `Err`, but part of it may be on disk, so 8192 is a
+    // possible end. It does not become durable.
+    footer(&path, 4096, 8192).failed();
+    full_sync(&path);
+    let (class, durable, _landing) =
+        classify(&path, 0, 5000, &[0; 10], true, 0, WriteKind::Payload);
+    assert_eq!((class, durable), (Some("ONE_SECTOR"), 8192));
+
+    // A later footer that lands and syncs rewrites the field: the failed
+    // attempt is no longer a possible end.
+    footer(&path, 4096, 4096).landed();
+    full_sync(&path);
+    let (class, durable, _landing) =
+        classify(&path, 0, 5000, &[0; 10], true, 0, WriteKind::Payload);
+    assert_eq!((class, durable), (None, 4096));
+}

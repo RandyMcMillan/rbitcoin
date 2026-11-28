@@ -1008,10 +1008,13 @@ impl TableFile {
             bytes,
             crate::write_probe::WriteKind::Length,
         );
-        self.pwrite_door(committed, offset, bytes).inspect(|()| {
-            #[cfg(feature = "write-probe")]
-            landing.landed();
-        })
+        let res = self.pwrite_door(committed, offset, bytes);
+        #[cfg(feature = "write-probe")]
+        match &res {
+            Ok(()) => landing.landed(),
+            Err(_) => landing.failed(),
+        }
+        res
     }
 
     /// Classify a payload write that bypasses the door (bulk io_uring) as the

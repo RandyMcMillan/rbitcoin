@@ -387,6 +387,97 @@ fn a_short_kept_restore_write_resumes_on_reopen() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A plan whose rename landed but whose directory sync failed is not yet
+/// durable. The next open syncs that name again before it writes a stem,
+/// so a power cut cannot keep part of the restore and lose the plan.
+#[cfg(debug_assertions)]
+#[test]
+fn a_found_legacy_plan_is_synced_before_any_stem_write() {
+    use rbitcoin_store::io_handle::{arm_fail_dir_sync_on_thread, disarm_thread_writes};
+    let dir = tmp();
+    let (txid, before, off, n) = store_with_txid_tail(&dir);
+    write_legacy_guard(&dir);
+    zero_at(&txid, off, n);
+    let plan = dir.join("tear_guard.plan");
+    for attempt in ["first", "retry"] {
+        arm_fail_dir_sync_on_thread(1);
+        let r = TxTable::open_tiny(&dir);
+        disarm_thread_writes();
+        assert!(
+            r.is_err(),
+            "the {attempt} open took a failed directory sync"
+        );
+        let mut tail = vec![0u8; n];
+        read_at(&txid, off, &mut tail);
+        assert!(
+            tail.iter().all(|b| *b == 0),
+            "the {attempt} open wrote a stem before the plan name was synced"
+        );
+        assert!(plan.exists(), "the {attempt} open did not leave its plan");
+    }
+    let s = Store::open_tiny(&dir).unwrap();
+    drop(s);
+    assert!(!plan.exists(), "open left its restore plan");
+    assert!(!dir.join("tear_guard").exists(), "open left tear_guard/");
+    assert_eq!(std::fs::read(&txid).unwrap(), before);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An open that unlinked the plan but failed the directory sync leaves the
+/// restored stems and the images. The next open finds no plan and syncs the
+/// hot directory before it removes an image, so the old plan cannot come
+/// back after the images are gone.
+#[cfg(debug_assertions)]
+#[test]
+fn an_absent_legacy_plan_is_synced_before_an_image_goes() {
+    use rbitcoin_store::io_handle::{arm_fail_dir_sync_on_thread, disarm_thread_writes};
+    let dir = tmp();
+    let (txid, before, off, n) = store_with_txid_tail(&dir);
+    let mut kept = Vec::new();
+    kept.extend_from_slice(b"CATK");
+    kept.extend_from_slice(&off.to_le_bytes());
+    kept.extend_from_slice(&(n as u32).to_le_bytes());
+    kept.extend_from_slice(&before[off as usize..off as usize + n]);
+    let side = dir.join("txid.body.kept");
+    std::fs::write(&side, kept).unwrap();
+    arm_fail_dir_sync_on_thread(1);
+    let r = TxTable::open_tiny(&dir);
+    disarm_thread_writes();
+    assert!(r.is_err(), "open took a failed directory sync");
+    assert!(
+        side.exists(),
+        "open removed the .kept before the plan removal was synced"
+    );
+    let s = Store::open_tiny(&dir).unwrap();
+    drop(s);
+    assert!(!side.exists(), "open left the .kept");
+    assert_eq!(std::fs::read(&txid).unwrap(), before);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The same holds for a tear guard with no plan beside it: open syncs the
+/// hot directory before it removes `tear_guard/`.
+#[cfg(debug_assertions)]
+#[test]
+fn an_absent_legacy_plan_is_synced_before_the_guard_goes() {
+    use rbitcoin_store::io_handle::{arm_fail_dir_sync_on_thread, disarm_thread_writes};
+    let dir = tmp();
+    store_130(&dir);
+    write_legacy_guard(&dir);
+    arm_fail_dir_sync_on_thread(1);
+    let r = TxTable::open_tiny(&dir);
+    disarm_thread_writes();
+    assert!(r.is_err(), "open took a failed directory sync");
+    assert!(
+        dir.join("tear_guard").exists(),
+        "open removed tear_guard/ before the plan removal was synced"
+    );
+    let s = Store::open_tiny(&dir).unwrap();
+    drop(s);
+    assert!(!dir.join("tear_guard").exists(), "open left tear_guard/");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Two tail slots that both fail to decode, a `.kept` that is not a `CATK`
 /// image, a sealed page 0 whose commit fails its checksum, or a restore plan
 /// that does not decode may hold the only copy of a page. Open refuses and

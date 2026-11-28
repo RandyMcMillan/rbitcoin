@@ -201,6 +201,10 @@ fn open_tmp(tmp: &Path, private: bool) -> std::io::Result<File> {
 /// Windows denies a directory handle (`ERROR_ACCESS_DENIED`), including with
 /// backup semantics. The file itself was already `sync_all`'d before rename.
 pub fn fsync_parent_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(debug_assertions)]
+    if crate::io_handle::take_fail_dir_sync_on_thread() {
+        return Err(std::io::Error::other("injected directory sync failure"));
+    }
     #[cfg(unix)]
     {
         let result = std::fs::File::open(dir)?.durable_sync_all();

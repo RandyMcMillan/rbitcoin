@@ -7,10 +7,11 @@
 //! with its only synced copy here. Open picks the copies to write back the
 //! way that build's open did, before it writes any stem, and keeps that
 //! choice in a synced [`PLAN_NAME`]. It then writes and syncs the stems,
-//! removes the plan, and removes the images. An open after a failed write
-//! or sync repeats the plan, so a partly written range never reads as
-//! intact. An image or plan that holds bytes but does not decode stops open
-//! and stays on disk.
+//! removes the plan, syncs the hot directory, and removes the images. An
+//! open after a failed write or sync repeats the plan, after it syncs the
+//! plan's name again, so a partly written range never reads as intact. An
+//! image or plan that holds bytes but does not decode stops open and stays
+//! on disk.
 
 use crate::durability::Durable;
 use crate::error::StoreError;
@@ -68,14 +69,20 @@ const STEMS: [&str; STEM_N] = [
 
 /// Put back what a leftover tear guard or `.kept` holds, then remove them.
 ///
-/// Absent files are a no-op. A plan an earlier open left is repeated as is.
-/// The plan goes only after every stem it names is synced, and the images
-/// only after the plan, so a crash in between replays the same bytes or
-/// selects nothing from the restored stems.
+/// Absent files are a no-op. A plan an earlier open left is repeated as is,
+/// after its name is synced again: that open may have renamed it in and
+/// failed the directory sync. The plan goes only after every stem it names
+/// is synced, and the images only after a hot directory sync that follows
+/// the plan's removal, including a removal an earlier open did and failed
+/// to sync. A crash in between replays the same bytes or selects nothing
+/// from the restored stems.
 pub(crate) fn replay_and_drop(hot: &Path, seq: &Path) -> Result<(), StoreError> {
     let plan_path = hot.join(PLAN_NAME);
     let plan = match load_plan(&plan_path)? {
-        Some(plan) => plan,
+        Some(plan) => {
+            sync_dir(hot)?;
+            plan
+        }
         None => {
             let plan = select(hot, seq)?;
             if !plan.is_empty() {
@@ -85,15 +92,27 @@ pub(crate) fn replay_and_drop(hot: &Path, seq: &Path) -> Result<(), StoreError> 
         }
     };
     apply(hot, seq, &plan)?;
-    remove_file_synced(&plan_path)?;
-    remove_file_synced(&hot.join(PLAN_TMP))?;
+    let unlinked = remove_if_present(&plan_path)? | remove_if_present(&hot.join(PLAN_TMP))?;
+    let mut sides = Vec::new();
     for name in STEMS {
-        remove_file_synced(&kept_side(&stem_path(hot, seq, name)))?;
+        let side = kept_side(&stem_path(hot, seq, name));
+        if side.try_exists().map_err(|e| StoreError::io(&side, e))? {
+            sides.push(side);
+        }
     }
     let guard = hot.join("tear_guard");
-    if guard.try_exists().map_err(|e| StoreError::io(&guard, e))? {
+    let guard_left = guard.try_exists().map_err(|e| StoreError::io(&guard, e))?;
+    // Images are removed only after this sync, so with none left an
+    // earlier plan removal was already synced.
+    if unlinked || guard_left || !sides.is_empty() {
+        sync_dir(hot)?;
+    }
+    for side in sides {
+        remove_file_synced(&side)?;
+    }
+    if guard_left {
         std::fs::remove_dir_all(&guard).map_err(|e| StoreError::io(&guard, e))?;
-        file::fsync_parent_dir(hot).map_err(|e| StoreError::io(hot, e))?;
+        sync_dir(hot)?;
     }
     Ok(())
 }
@@ -270,18 +289,27 @@ fn persist_plan(hot: &Path, plan: &[PlannedWrite]) -> Result<(), StoreError> {
         .map_err(|e| StoreError::io(&tmp, e))?;
     drop(file);
     std::fs::rename(&tmp, &dst).map_err(|e| StoreError::io(&dst, e))?;
-    file::fsync_parent_dir(hot).map_err(|e| StoreError::io(hot, e))
+    sync_dir(hot)
+}
+
+fn sync_dir(dir: &Path) -> Result<(), StoreError> {
+    file::fsync_parent_dir(dir).map_err(|e| StoreError::io(dir, e))
+}
+
+/// Unlink `path`; `false` when it was already absent.
+fn remove_if_present(path: &Path) -> Result<bool, StoreError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(StoreError::io(path, e)),
+    }
 }
 
 fn remove_file_synced(path: &Path) -> Result<(), StoreError> {
-    match std::fs::remove_file(path) {
-        Ok(()) => {
-            let parent = path.parent().unwrap_or_else(|| Path::new("."));
-            file::fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(StoreError::io(path, e)),
+    if remove_if_present(path)? {
+        sync_dir(path.parent().unwrap_or_else(|| Path::new(".")))?;
     }
+    Ok(())
 }
 
 fn read_or_empty(path: &Path) -> Result<Vec<u8>, StoreError> {

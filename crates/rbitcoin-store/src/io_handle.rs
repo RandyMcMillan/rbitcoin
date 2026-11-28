@@ -423,18 +423,29 @@ pub fn arm_fail_sync_on_thread(n: u32) {
     FAIL_SYNC_ON_THREAD.with(|slot| slot.set(n));
 }
 
-/// Clear [`arm_short_pwrite_len`] and [`arm_fail_sync_on_thread`] on this thread.
+/// Fail the next `n` [`crate::file::fsync_parent_dir`] calls on this
+/// thread, after the rename or unlink they follow has run.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn arm_fail_dir_sync_on_thread(n: u32) {
+    FAIL_DIR_SYNC_ON_THREAD.with(|slot| slot.set(n));
+}
+
+/// Clear [`arm_short_pwrite_len`], [`arm_fail_sync_on_thread`], and
+/// [`arm_fail_dir_sync_on_thread`] on this thread.
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub fn disarm_thread_writes() {
     SHORT_PWRITE_LEN.with(|slot| slot.set((0, 0)));
     FAIL_SYNC_ON_THREAD.with(|slot| slot.set(0));
+    FAIL_DIR_SYNC_ON_THREAD.with(|slot| slot.set(0));
 }
 
 #[cfg(debug_assertions)]
 thread_local! {
     static SHORT_PWRITE_LEN: std::cell::Cell<(usize, u32)> = const { std::cell::Cell::new((0, 0)) };
     static FAIL_SYNC_ON_THREAD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static FAIL_DIR_SYNC_ON_THREAD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(debug_assertions)]
@@ -451,14 +462,22 @@ fn take_short_pwrite_len(len: usize) -> bool {
 
 #[cfg(debug_assertions)]
 fn take_fail_sync_on_thread() -> bool {
-    FAIL_SYNC_ON_THREAD.with(|slot| {
-        let n = slot.get();
-        if n == 0 {
-            return false;
-        }
-        slot.set(n - 1);
-        true
-    })
+    FAIL_SYNC_ON_THREAD.with(take_one)
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn take_fail_dir_sync_on_thread() -> bool {
+    FAIL_DIR_SYNC_ON_THREAD.with(take_one)
+}
+
+#[cfg(debug_assertions)]
+fn take_one(slot: &std::cell::Cell<u32>) -> bool {
+    let n = slot.get();
+    if n == 0 {
+        return false;
+    }
+    slot.set(n - 1);
+    true
 }
 
 /// Fail the next `n` preads on `handle` before any byte is returned.

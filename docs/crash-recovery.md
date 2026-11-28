@@ -36,10 +36,11 @@ transaction.
   `tear_guard/` or `{stem}.kept`, but a pre-0.10 master build did. Open
   picks the page images to write back the way that build's open did and
   saves that choice in a synced `tear_guard.plan` before it writes a stem.
-  It then writes and syncs the stems, removes the plan, and removes the
-  images. An open after a failed write or sync repeats the plan. An image
-  or plan that holds bytes but does not decode stops open with `Corrupt`
-  and stays on disk.
+  It then writes and syncs the stems, removes the plan, syncs the hot
+  directory, and removes the images. An open after a failed write or sync
+  syncs the plan's name again and repeats the plan. An image or plan that
+  holds bytes but does not decode stops open with `Corrupt` and stays on
+  disk.
 - Class C `confirmed[]` and `header_txs_*` write a synced `*.ahead` sidecar
   of the intended pages before an in-place write, and open restores it before
   reading the table. An array flush always images page 0, because it rewrites

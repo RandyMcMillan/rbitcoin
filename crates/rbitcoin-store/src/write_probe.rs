@@ -39,41 +39,55 @@ fn dirty() -> &'static Mutex<HashMap<PathBuf, Dirty>> {
     D.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// What a sync starting now covers: the writes made before it, the last
-/// trailer written before it, and the leading header the file held then.
+/// What a sync starting now covers: the writes made before it, and the
+/// trailer and leading header ends it makes durable. `cover` is the version
+/// it took; every end written before it carries a lower one.
 #[doc(hidden)]
 pub struct SyncPoint {
     seq: u64,
-    trailer: Option<(u64, u64)>,
-    header: Option<(u64, u64)>,
+    cover: u64,
+    trailer: Option<u64>,
+    header: Option<u64>,
 }
 
 /// A sync covers only the writes that landed before it began. A write that
 /// lands while it waits, or is still in flight, is not covered by it.
-/// `header` is the leading header end the file holds now ([`header_on`]).
+/// `file` is a leading-header table's handle (`None` for a trailing one):
+/// its header is read here, under the lock that takes the sync's version,
+/// so a sync that takes a later version never saw an older header.
 #[doc(hidden)]
-pub fn sync_begin(path: &Path, header: Option<u64>) -> SyncPoint {
+pub fn sync_begin(path: &Path, file: Option<&std::fs::File>) -> SyncPoint {
     let seq = dirty()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(path)
         .map_or(0, |d| d.next);
     let mut t = ends().lock().unwrap_or_else(|e| e.into_inner());
-    let trailer = t.written.get(path).copied();
-    // A sync that begins later sees a header at least as new.
-    let header = header.map(|end| (t.version(), end));
+    let cover = t.version();
+    let trailer = t.trailer.get(path).and_then(End::latest);
+    let header = file
+        .and_then(|f| header_on(f, path))
+        .or_else(|| t.header.get(path).and_then(End::latest));
     SyncPoint {
         seq,
+        cover,
         trailer,
         header,
     }
 }
 
-/// A sync that began at `at` finished: the writes and trailer it covered are
-/// durable. A trailer older than the durable one, by version, stays behind
-/// it: a sync that began earlier can finish after a later one.
+/// A sync that began at `at` finished: the writes it covered are durable,
+/// and so is the last end written before it. Ends written after it stay
+/// possible. A sync that began earlier can finish after a later one; its
+/// lower version leaves the later one's record alone. A barrier the debug
+/// build skipped (`skip-flushes`) made nothing durable, so it records
+/// nothing.
 #[doc(hidden)]
 pub fn synced(path: &Path, at: SyncPoint) {
+    #[cfg(debug_assertions)]
+    if crate::durability::flushes_skipped() {
+        return;
+    }
     if let Some(d) = dirty()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -82,35 +96,34 @@ pub fn synced(path: &Path, at: SyncPoint) {
         d.ranges.retain(|&(seq, _, _)| seq >= at.seq);
     }
     let mut t = ends().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((version, end)) = at.trailer {
-        if t.durable.get(path).is_none_or(|&(have, _)| have < version) {
-            t.durable.insert(path.to_path_buf(), (version, Some(end)));
+    let Ends {
+        trailer, header, ..
+    } = &mut *t;
+    for (map, end) in [(trailer, at.trailer), (header, at.header)] {
+        if end.is_none() && !map.contains_key(path) {
+            continue;
         }
-    }
-    if let Some((version, end)) = at.header {
-        if t.header.get(path).is_none_or(|&(have, _)| have < version) {
-            t.header.insert(path.to_path_buf(), (version, Some(end)));
-        }
+        map.entry(path.to_path_buf())
+            .or_default()
+            .cover(at.cover, end);
     }
 }
 
 /// A leading-header table opened from disk: the header end it read is
 /// durable, unless the probe already has a record of the path.
 pub(crate) fn opened_leading(path: &Path, end: u64) {
-    let mut t = ends().lock().unwrap_or_else(|e| e.into_inner());
-    if t.header.contains_key(path) {
-        return;
-    }
-    let version = t.version();
-    t.header.insert(path.to_path_buf(), (version, Some(end)));
+    ends()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .opened(Side::Header, path, end);
 }
 
-/// A leading-header table created at `path` has no durable header yet. A
-/// sync that began on an earlier file there is stale.
+/// A leading-header table created at `path` has no durable header yet.
 pub(crate) fn created_leading(path: &Path) {
-    let mut t = ends().lock().unwrap_or_else(|e| e.into_inner());
-    let version = t.version();
-    t.header.insert(path.to_path_buf(), (version, None));
+    ends()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .created(Side::Header, path);
 }
 
 /// The leading header end `file` holds: bytes 8..16, read through the
@@ -121,42 +134,82 @@ pub(crate) fn header_on(file: &std::fs::File, path: &Path) -> Option<u64> {
     Some(u64::from_le_bytes(b))
 }
 
-/// A trailing table opened from disk: its footer end is durable. Only a
-/// path the probe has no record of takes it, so a table this process
-/// created and has not synced keeps no durable end.
+/// A trailing table opened from disk: its footer end is durable, unless the
+/// probe already has a record of the path (a table this process created
+/// and has not synced keeps no durable end).
 #[doc(hidden)]
 pub fn opened_trailing(path: &Path, end: u64) {
-    let mut t = ends().lock().unwrap_or_else(|e| e.into_inner());
-    if t.written.contains_key(path) || t.durable_end(path).is_some() {
-        return;
-    }
-    let version = t.version();
-    t.written.insert(path.to_path_buf(), (version, end));
-    t.durable.insert(path.to_path_buf(), (version, Some(end)));
+    ends()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .opened(Side::Trailer, path, end);
 }
 
 /// A trailing table created at `path` has no durable end yet, whatever an
 /// earlier file at that path had.
 pub(crate) fn created_trailing(path: &Path) {
-    let mut t = ends().lock().unwrap_or_else(|e| e.into_inner());
-    t.written.remove(path);
-    // A newer version with no end: a sync that began on the old file is stale.
-    let version = t.version();
-    t.durable.insert(path.to_path_buf(), (version, None));
+    ends()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .created(Side::Trailer, path);
 }
 
-/// Trailer and leading header ends per file, each with the version it took
-/// when observed. Versions only grow, so a stale sync is told apart from a
-/// length that shrank the file.
+#[derive(Clone, Copy)]
+enum Side {
+    Trailer,
+    Header,
+}
+
+/// One file's length ends: the one a sync (or open) made durable, and the
+/// ones written since that no sync has covered. A crash can leave any of
+/// them on the device, so all of them are possible ends.
+#[derive(Default)]
+struct End {
+    /// (version, end). `None` end: created this process, nothing durable.
+    durable: Option<(u64, Option<u64>)>,
+    /// (version, end), oldest first.
+    written: Vec<(u64, u64)>,
+}
+
+impl End {
+    /// The end a sync starting now makes durable, if any is known.
+    fn latest(&self) -> Option<u64> {
+        self.written
+            .last()
+            .map(|&(_, end)| end)
+            .or_else(|| self.durable.and_then(|(_, end)| end))
+    }
+
+    fn cover(&mut self, cover: u64, end: Option<u64>) {
+        if self.durable.is_some_and(|(have, _)| have >= cover) {
+            return;
+        }
+        let end = end.or_else(|| self.durable.and_then(|(_, end)| end));
+        self.durable = Some((cover, end));
+        self.written.retain(|&(v, _)| v > cover);
+    }
+
+    /// Every end a crash can leave.
+    fn possible(&self) -> impl Iterator<Item = u64> + '_ {
+        self.durable
+            .and_then(|(_, end)| end)
+            .into_iter()
+            .chain(self.written.iter().map(|&(_, end)| end))
+    }
+
+    /// Created this process and never synced.
+    fn fresh(&self) -> bool {
+        self.durable.is_some_and(|(_, end)| end.is_none())
+    }
+}
+
+/// Trailer and leading header ends per file. Versions only grow, so a
+/// stale sync is told apart from a length that shrank the file.
 #[derive(Default)]
 struct Ends {
     next: u64,
-    /// The last trailer written.
-    written: HashMap<PathBuf, (u64, u64)>,
-    /// The last trailer a sync covered. `None` is a created file.
-    durable: HashMap<PathBuf, (u64, Option<u64>)>,
-    /// The last leading header end a sync covered. `None` is a created file.
-    header: HashMap<PathBuf, (u64, Option<u64>)>,
+    trailer: HashMap<PathBuf, End>,
+    header: HashMap<PathBuf, End>,
 }
 
 impl Ends {
@@ -165,8 +218,42 @@ impl Ends {
         self.next
     }
 
-    fn durable_end(&self, path: &Path) -> Option<u64> {
-        self.durable.get(path).and_then(|&(_, end)| end)
+    fn side(&mut self, side: Side) -> &mut HashMap<PathBuf, End> {
+        match side {
+            Side::Trailer => &mut self.trailer,
+            Side::Header => &mut self.header,
+        }
+    }
+
+    fn opened(&mut self, side: Side, path: &Path, end: u64) {
+        let version = self.version();
+        let rec = self.side(side).entry(path.to_path_buf()).or_default();
+        if rec.possible().next().is_some() || rec.fresh() {
+            return;
+        }
+        rec.durable = Some((version, Some(end)));
+    }
+
+    /// A fresh version with no end: a sync that began on the file that was
+    /// at `path` before is stale.
+    fn created(&mut self, side: Side, path: &Path) {
+        let version = self.version();
+        self.side(side).insert(
+            path.to_path_buf(),
+            End {
+                durable: Some((version, None)),
+                written: Vec::new(),
+            },
+        );
+    }
+
+    fn written(&mut self, side: Side, path: &Path, end: u64) {
+        let version = self.version();
+        self.side(side)
+            .entry(path.to_path_buf())
+            .or_default()
+            .written
+            .push((version, end));
     }
 }
 
@@ -211,15 +298,15 @@ fn unsynced_in(path: &Path, from: u64, to: u64) -> bool {
 /// A write [`write`] classified and its caller has not yet finished. Drop it
 /// once the write returns, `Ok` or `Err`: a failed write may have landed
 /// some bytes. A payload range takes its sequence number then, so a sync
-/// that began while it was in flight does not clear it. A trailer becomes
-/// the last one written only through [`Landing::landed`]: after an `Err`
-/// the file's footer is unknown, so the previous end stays.
+/// that began while it was in flight does not clear it. A length (footer or
+/// leading header) becomes a written end only through [`Landing::landed`]:
+/// after an `Err` the file's length is unknown, so the previous ends stay.
 #[must_use = "hold it until the write returns"]
 #[doc(hidden)]
 pub struct Landing {
     path: PathBuf,
     payload: Option<u64>,
-    trailer: Option<u64>,
+    length: Option<(Side, u64)>,
     ok: bool,
 }
 
@@ -242,10 +329,11 @@ impl Drop for Landing {
                 }
             }
         }
-        if let Some(end) = self.trailer.filter(|_| self.ok) {
-            let mut t = ends().lock().unwrap_or_else(|e| e.into_inner());
-            let version = t.version();
-            t.written.insert(self.path.clone(), (version, end));
+        if let Some((side, end)) = self.length.filter(|_| self.ok) {
+            ends()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .written(side, &self.path, end);
         }
     }
 }
@@ -294,26 +382,34 @@ pub fn classify(
     let mut landing = Landing {
         path: path.to_path_buf(),
         payload: None,
-        trailer: None,
+        length: None,
         ok: false,
     };
     let len = bytes.len() as u64;
     if len == 0 {
         return (None, committed, landing);
     }
-    // A trailer moves with the length, so its durable end is the last one a
-    // sync covered. A leading header: `committed` is the end the file holds
-    // now (a publish moves RAM first), and a crash can leave either it or
-    // the last synced end, so the longer one bounds the durable bytes. An
-    // unsynced shrink keeps the old end until a sync covers it.
-    let committed = {
+    // Every end a crash can leave: the last one a sync covered, each one
+    // written since, and for a leading header the end the file holds now
+    // (`committed`; a publish moves RAM first). A payload below the longest
+    // overwrites bytes some outcome names. A length is judged from the
+    // longest too: a byte between the ends was named by an earlier length,
+    // checked when it was published, or rewritten in place, classed when
+    // it was written. A fresh file is one this process created and never
+    // synced.
+    let (committed, fresh) = {
         let t = ends().lock().unwrap_or_else(|e| e.into_inner());
-        if trailing {
-            t.durable_end(path).unwrap_or(header_len)
+        let rec = if trailing {
+            t.trailer.get(path)
         } else {
-            let synced = t.header.get(path).and_then(|&(_, end)| end);
-            synced.map_or(committed, |end| end.max(committed))
-        }
+            t.header.get(path)
+        };
+        let leading = (!trailing).then_some(committed);
+        let longest = rec.into_iter().flat_map(End::possible).chain(leading).max();
+        (
+            longest.unwrap_or(header_len),
+            !trailing && rec.is_some_and(End::fresh),
+        )
     };
     let end = offset + len;
     let len_field = kind == WriteKind::Length;
@@ -324,9 +420,12 @@ pub fn classify(
             Ok(field) => u64::from_le_bytes(field),
             Err(_) => end,
         };
-        if trailing {
-            landing.trailer = Some(new);
-        }
+        let side = if trailing {
+            Side::Trailer
+        } else {
+            Side::Header
+        };
+        landing.length = Some((side, new));
         // A trailing length counts its footer, so the payload it names ends
         // one footer earlier, and starts where the old footer sat.
         let footer = if trailing {
@@ -375,7 +474,8 @@ pub fn classify(
         }
     } else if offset >= committed {
         None
-    } else if committed <= header_len {
+    } else if fresh && committed <= header_len {
+        // Only the header of a file nothing has synced yet.
         Some("CREATE")
     } else {
         Some(in_place_class(path, offset, len))

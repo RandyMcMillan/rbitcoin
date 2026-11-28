@@ -1030,14 +1030,17 @@ impl TableFile {
         )
     }
 
-    /// Write probe: the leading header end this file holds now. A trailing
-    /// table has none.
+    /// Write probe: the handle that holds this file's leading header. A
+    /// trailing table has none.
+    #[cfg(feature = "write-probe")]
+    fn probe_file(&self) -> Option<&File> {
+        (!self.trailing_header).then_some(&self.read_file)
+    }
+
+    /// Write probe: the leading header end this file holds now.
     #[cfg(feature = "write-probe")]
     fn probe_header(&self) -> Option<u64> {
-        if self.trailing_header {
-            return None;
-        }
-        crate::write_probe::header_on(&self.read_file, &self.path)
+        crate::write_probe::header_on(self.probe_file()?, &self.path)
     }
 
     #[cfg(feature = "write-probe")]
@@ -1596,7 +1599,7 @@ impl TableFile {
             ));
         }
         #[cfg(feature = "write-probe")]
-        let probe_n = crate::write_probe::sync_begin(&self.path, self.probe_header());
+        let probe_n = crate::write_probe::sync_begin(&self.path, self.probe_file());
         self.read_file
             .durable_sync_data()
             .map_err(|e| StoreError::io(&self.path, e))?;
@@ -1647,7 +1650,7 @@ impl TableFile {
         #[cfg(feature = "write-probe")]
         let probe_n: Vec<_> = files
             .iter()
-            .map(|f| crate::write_probe::sync_begin(&f.path, f.probe_header()))
+            .map(|f| crate::write_probe::sync_begin(&f.path, f.probe_file()))
             .collect();
         let mut handles: Vec<_> = files.iter().map(|f| f.io_handle()).collect();
         handles.extend(
@@ -1725,7 +1728,7 @@ impl TableFile {
             ));
         }
         #[cfg(feature = "write-probe")]
-        let probe_n = crate::write_probe::sync_begin(&self.path, self.probe_header());
+        let probe_n = crate::write_probe::sync_begin(&self.path, self.probe_file());
         self.file
             .lock()
             .unwrap()

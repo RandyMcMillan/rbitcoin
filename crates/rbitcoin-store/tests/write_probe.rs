@@ -1,6 +1,7 @@
 //! The write probe's own classes: a write counts once it lands, and a
 //! length on a live mark that misses it is not safe.
-use rbitcoin_store::file::TRAILING_FOOTER_LEN;
+use rbitcoin_primitives::TableKind;
+use rbitcoin_store::file::{TableFile, TRAILING_FOOTER_LEN};
 use rbitcoin_store::page_guard::{arm_page_guard_group, clear_page_guard, PAGE};
 use rbitcoin_store::testutil::TempDir;
 use rbitcoin_store::write_probe::{
@@ -22,6 +23,15 @@ impl Store {
 
     fn path(&self, name: &str) -> PathBuf {
         self.0.path().join(name)
+    }
+
+    /// A file at `name` whose leading header holds `end`, as a sync reads it.
+    fn header(&self, name: &str, end: u64) -> std::fs::File {
+        let path = self.path(name);
+        let mut bytes = vec![0u8; 16];
+        bytes[8..16].copy_from_slice(&end.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::File::open(&path).unwrap()
     }
 
     /// Arm a real mark under `guard/` over `pages` of `name`.
@@ -83,11 +93,11 @@ fn a_sync_begun_before_a_footer_lands_does_not_make_it_durable() {
     let store = Store::new();
     let path = store.path("footer-in-flight");
     opened_trailing(&path, 100);
-    let footer = TRAILING_FOOTER_LEN as u64;
+    let footer_len = TRAILING_FOOTER_LEN as u64;
     let (_, _, landing) = classify(
         &path,
         100,
-        200 - footer,
+        200 - footer_len,
         &200u64.to_le_bytes(),
         true,
         0,
@@ -96,6 +106,11 @@ fn a_sync_begun_before_a_footer_lands_does_not_make_it_durable() {
     let early = sync_begin(&path, None);
     landing.landed();
     synced(&path, early);
+    // The 200 footer stays a written end until a later sync covers it.
+    let (class, durable, _landing) = classify(&path, 0, 150, &[0; 10], true, 0, WriteKind::Payload);
+    assert_eq!((class, durable), (Some("ONE_SECTOR"), 200));
+    footer(&path, 200, 100).landed();
+    full_sync(&path);
     let (class, durable, _landing) = classify(&path, 0, 150, &[0; 10], true, 0, WriteKind::Payload);
     assert_eq!((class, durable), (None, 100));
 }
@@ -247,12 +262,18 @@ fn a_growing_footer_in_one_sector_is_safe_after_its_payload_syncs() {
 fn a_write_over_an_unsynced_shrink_is_below_the_durable_end() {
     let store = Store::new();
     let path = store.path("shrink");
-    synced(&path, sync_begin(&path, Some(8192)));
+    synced(
+        &path,
+        sync_begin(&path, Some(&store.header("shrink", 8192))),
+    );
     // `set_logical_len(4096)` wrote the shorter header; no sync yet.
     let (class, durable, _landing) =
         classify(&path, 4096, 4096, &[0; 1024], false, 16, WriteKind::Payload);
     assert_eq!((class, durable), (Some("MULTI_SECTOR"), 8192));
-    synced(&path, sync_begin(&path, Some(4096)));
+    synced(
+        &path,
+        sync_begin(&path, Some(&store.header("shrink", 4096))),
+    );
     let (class, durable, _landing) =
         classify(&path, 4096, 4096, &[0; 1024], false, 16, WriteKind::Payload);
     assert_eq!((class, durable), (None, 4096));
@@ -275,4 +296,71 @@ fn a_cold_index_table_keeps_its_class() {
     let (class, _, _landing) =
         classify(&path, 8192, 600, &[0; 1024], false, 16, WriteKind::Payload);
     assert_eq!(class, Some("FIXTURE"));
+}
+
+fn publish_landed(path: &Path, on_file: u64, new: u64) {
+    classify(
+        path,
+        on_file,
+        8,
+        &new.to_le_bytes(),
+        false,
+        16,
+        WriteKind::Length,
+    )
+    .2
+    .landed();
+}
+
+#[test]
+fn a_written_footer_bounds_an_overwrite_before_it_syncs() {
+    let store = Store::new();
+    let path = store.path("footer-written");
+    opened_trailing(&path, 4096);
+    footer(&path, 4096, 8192).landed();
+    let at = |offset| classify(&path, 0, offset, &[0; 1024], true, 0, WriteKind::Payload);
+    let (class, durable, _landing) = at(5000);
+    assert_eq!((class, durable), (Some("MULTI_SECTOR"), 8192));
+    // An unsynced shrink does not lower it.
+    footer(&path, 4096, 4096).landed();
+    let (class, durable, _landing) = at(5000);
+    assert_eq!((class, durable), (Some("MULTI_SECTOR"), 8192));
+    // A footer write that failed does not raise it.
+    drop(footer(&path, 4096, 16384));
+    let (class, durable, _landing) = at(9000);
+    assert_eq!((class, durable), (None, 8192));
+    // Once a sync covers the shrink, only it is possible.
+    full_sync(&path);
+    let (class, durable, _landing) = at(5000);
+    assert_eq!((class, durable), (None, 4096));
+}
+
+#[test]
+fn every_unsynced_header_end_bounds_an_overwrite() {
+    let store = Store::new();
+    let path = store.path("header-written");
+    synced(
+        &path,
+        sync_begin(&path, Some(&store.header("header-written", 2048))),
+    );
+    publish_landed(&path, 2048, 8192);
+    publish_landed(&path, 8192, 4096);
+    // The file holds 4096 and 2048 is synced, but 8192 may have landed.
+    let (class, durable, _landing) =
+        classify(&path, 4096, 5000, &[0; 1024], false, 16, WriteKind::Payload);
+    assert_eq!((class, durable), (Some("MULTI_SECTOR"), 8192));
+}
+
+#[test]
+fn only_a_fresh_table_header_write_is_create() {
+    let store = Store::new();
+    let path = store.path("fresh");
+    let table = TableFile::create(&path, TableKind::TxOut).unwrap();
+    let at = |offset| classify(&path, 16, offset, &[0; 1024], false, 16, WriteKind::Payload).0;
+    assert_eq!(at(0), Some("CREATE"));
+    assert_eq!(at(16), None);
+    // Synced and still empty: its header is durable.
+    table.sync_data_only().unwrap();
+    assert_eq!(at(0), Some("MULTI_SECTOR"));
+    assert_eq!(at(16), None);
 }
